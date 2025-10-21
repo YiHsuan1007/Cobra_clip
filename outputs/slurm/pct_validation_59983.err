@@ -1,0 +1,16 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/asdf1234/cobra/cobra/cli/calibrate_run.py", line 119, in <module>
+    main()
+  File "/work/asdf1234/cobra/cobra/cli/calibrate_run.py", line 92, in main
+    model = load_model(args.ckpt, hf_token=args.hf_token)
+  File "/work/asdf1234/cobra/cobra/models/load.py", line 59, in load
+    raise ValueError(f"Couldn't find `{model_id_or_path = }; check `cobra.available_model_names()`")
+ValueError: Couldn't find `model_id_or_path = '/work/asdf1234/checkpoints/cobra_3b/pytorch_model.bin'; check `cobra.available_model_names()`

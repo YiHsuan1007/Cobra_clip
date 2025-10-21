@@ -9,6 +9,7 @@ from typing import Callable, Dict, Tuple
 
 import timm
 import torch
+import torch.nn as nn
 from PIL import Image
 from timm.models.vision_transformer import Block, VisionTransformer
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy, transformer_auto_wrap_policy
@@ -51,6 +52,10 @@ class DinoSigLIPViTBackbone(VisionBackbone):
             self.siglip_timm_path_or_url, pretrained=True, num_classes=0, img_size=self.default_image_size,
         )
         self.siglip_featurizer.eval()
+
+        # Named tap points exposed for percentile observers.
+        self.tap_post_dino = nn.Identity()
+        self.tap_post_siglip = nn.Identity()
 
         # Monkey-Patch the `forward()` function of the featurizers to ensure FSDP-compatibility
         #   => Note: By default set `get_intermediate_layers` to return the *SECOND-TO-LAST* layer patches!
@@ -136,8 +141,8 @@ class DinoSigLIPViTBackbone(VisionBackbone):
 
     def forward(self, pixel_values: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Runs the transformed image/pixel tensors through each vision backbone, returning concatenated patches."""
-        dino_patches = self.dino_featurizer(pixel_values["dino"])
-        siglip_patches = self.siglip_featurizer(pixel_values["siglip"])
+        dino_patches = self.tap_post_dino(self.dino_featurizer(pixel_values["dino"]))
+        siglip_patches = self.tap_post_siglip(self.siglip_featurizer(pixel_values["siglip"]))
 
         return torch.cat([dino_patches, siglip_patches], dim=2)
 

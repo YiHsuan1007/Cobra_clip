@@ -1,0 +1,16 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/asdf1234/cobra/cobra/cli/calibrate_run.py", line 14, in <module>
+    from cobra.quantize.config import QuantConfig
+  File "/work/asdf1234/cobra/cobra/quantize/__init__.py", line 1, in <module>
+    from .int_conv import *
+  File "/work/asdf1234/cobra/cobra/quantize/int_conv.py", line 4, in <module>
+    from quantize.quantizer import UniformAffineQuantizer
+ModuleNotFoundError: No module named 'quantize'

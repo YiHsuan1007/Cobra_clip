@@ -1,0 +1,11 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+/var/spool/slurmd/job59158/slurm_script: line 15: /home/asdf1234/miniconda3/etc/profile.d/conda.sh: No such file or directory
+
+CondaError: Run 'conda init' before 'conda activate'
+
+/work/asdf1234/miniconda3/envs/cobra-1/bin/python: Error while finding module specification for 'cobra_test.cli.calibrate_run' (ModuleNotFoundError: No module named 'cobra_test')
+/work/asdf1234/miniconda3/envs/cobra-1/bin/python: Error while finding module specification for 'cobra_test.cli.enable_pct' (ModuleNotFoundError: No module named 'cobra_test')
+/work/asdf1234/miniconda3/envs/cobra-1/bin/python: Error while finding module specification for 'cobra_test.cli.enable_pct' (ModuleNotFoundError: No module named 'cobra_test')

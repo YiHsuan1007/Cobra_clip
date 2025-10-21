@@ -1,0 +1,6 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+/var/spool/slurmd/job59987/slurm_script: line 42: 783249 Killed                  python -m cobra.cli.calibrate_run --ckpt "$CKPT_PATH" --data "$DATA_PATH" --cfg "$CFG_PATH" --targets "$TARGETS"
+slurmstepd-hgpn05: error: Detected 1 oom_kill event in StepId=59987.batch. Some of the step tasks have been OOM Killed.

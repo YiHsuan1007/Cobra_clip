@@ -1,0 +1,35 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+Traceback (most recent call last):
+  File "/work/asdf1234/cobra/cobra/quantize/calibrate.py", line 69, in _make_observer
+    return observer_factory(cfg.p_max, cfg.mode, cfg.max_samples, target=name)
+TypeError: PercentileObserver.__init__() got an unexpected keyword argument 'target'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/asdf1234/cobra/cobra/cli/calibrate_run.py", line 119, in <module>
+    main()
+  File "/work/asdf1234/cobra/cobra/cli/calibrate_run.py", line 109, in main
+    stats = quant_pct.calibrate(model, dataloader, cfg, targets=user_targets)
+  File "/work/asdf1234/cobra/cobra/switches/quant_pct.py", line 37, in calibrate
+    return calibrate_model(model, dataloader, cfg, targets=targets)
+  File "/work/asdf1234/cobra/cobra/quantize/calibrate.py", line 76, in calibrate_model
+    observers = {name: _make_observer(name) for name in target_list}
+  File "/work/asdf1234/cobra/cobra/quantize/calibrate.py", line 76, in <dictcomp>
+    observers = {name: _make_observer(name) for name in target_list}
+  File "/work/asdf1234/cobra/cobra/quantize/calibrate.py", line 71, in _make_observer
+    observer = observer_factory(cfg.p_max, cfg.mode, cfg.max_samples)
+  File "/work/asdf1234/cobra/cobra/quantize/observers/hist_observers.py", line 24, in __init__
+    super().__init__(granularity,min_limit,max_limit)
+  File "/work/asdf1234/cobra/cobra/quantize/observers/observer_abc.py", line 65, in __init__
+    self._ch_axis = analysis_dim(granularity)
+  File "/work/asdf1234/cobra/cobra/quantize/observers/observer_abc.py", line 51, in analysis_dim
+    elif granularities[:3] == "dim":
+TypeError: 'float' object is not subscriptable

@@ -1,0 +1,3 @@
+[Step 1] Calibration with targets: vision.dino,vision.siglip,mm.out
+10/20 [01:53:50] INFO     | >> [*] Loading from local path            load.py:52
+                          `/work/asdf1234/checkpoints/cobra_3b`                 

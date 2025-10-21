@@ -1,0 +1,5 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+/var/spool/slurmd/job59854/slurm_script: line 17: /home/asdf1234/miniconda3/etc/profile.d/conda.sh: No such file or directory

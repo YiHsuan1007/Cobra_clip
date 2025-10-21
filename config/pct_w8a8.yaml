@@ -1,0 +1,10 @@
+p_max: 99.9999                  # 百分位(0-100]，例：99.9 或 99.95
+mode: tensor                 # 目前僅支援 tensor
+stats_path: outputs/percentile_stats.pt
+max_samples: 1000000
+batch_size: 8
+num_batches: null            # 或填正整數以限制批次數
+prompt: "Describe the image in detail."
+num_workers: 4
+device: null                 # "cuda" / "cpu"；留空自動判定
+targets: ["vision.dino", "vision.siglip", "mm.out"]

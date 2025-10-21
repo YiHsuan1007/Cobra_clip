@@ -1,0 +1,16 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/asdf1234/cobra/cobra/cli/enable_pct.py", line 253, in <module>
+    main()
+  File "/work/asdf1234/cobra/cobra/cli/enable_pct.py", line 249, in main
+    dumper.save(out_dir, clip_values=clip_values, mode=args.mode)
+  File "/work/asdf1234/cobra/cobra/cli/enable_pct.py", line 48, in save
+    post = phases.get("post") or pre
+RuntimeError: Boolean value of Tensor with more than one value is ambiguous

@@ -1,0 +1,5 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+/work/asdf1234/miniconda3/envs/cobra-1/etc/conda/deactivate.d/deactivate-gxx_linux-64.sh: line 68: CONDA_BACKUP_CXX: unbound variable

@@ -1,0 +1,58 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/asdf1234/cobra/cobra/cli/calibrate_run.py", line 119, in <module>
+    main()
+  File "/work/asdf1234/cobra/cobra/cli/calibrate_run.py", line 109, in main
+    stats = quant_pct.calibrate(model, dataloader, cfg, targets=user_targets)
+  File "/work/asdf1234/cobra/cobra/switches/quant_pct.py", line 37, in calibrate
+    return calibrate_model(model, dataloader, cfg, targets=targets)
+  File "/work/asdf1234/cobra/cobra/quantize/calibrate.py", line 151, in calibrate_model
+    model(
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/work/asdf1234/cobra/cobra/models/vlms/cobra.py", line 341, in forward
+    patch_features = self.vision_backbone({k: pixel_values[k][multimodal_indices] for k in pixel_values})
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/work/asdf1234/cobra/cobra/models/backbones/vision/dinosiglip_vit.py", line 145, in forward
+    siglip_patches = self.tap_post_siglip(self.siglip_featurizer(pixel_values["siglip"]))
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1581, in _call_impl
+    hook_result = hook(self, args, result)
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/work/asdf1234/cobra/cobra/integration/hooks.py", line 44, in hook
+    observer.update(output)
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/work/asdf1234/cobra/cobra/quantize/observers/simple_percentile.py", line 51, in update
+    values = data.abs().to(torch.float32).view(-1).cpu()
+RuntimeError: view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.
