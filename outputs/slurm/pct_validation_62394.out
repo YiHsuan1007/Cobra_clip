@@ -1,0 +1,15 @@
+[Step 5] Unit tests for observers and hooks
+============================= test session starts ==============================
+platform linux -- Python 3.10.18, pytest-8.4.2, pluggy-1.6.0
+rootdir: /work/asdf1234/cobra
+configfile: pyproject.toml
+collected 10 items
+
+cobra/tests/test_bits_config.py ..                                       [ 20%]
+cobra/tests/test_clipping.py ...                                         [ 50%]
+cobra/tests/test_hooks_integration.py .                                  [ 60%]
+cobra/tests/test_observers.py ...                                        [ 90%]
+cobra/tests/test_visual_pct.py .                                         [100%]
+
+============================== 10 passed in 4.31s ==============================
+[Done] Validation artifacts saved in /work/asdf1234/cobra/outputs/pct_validation_62394

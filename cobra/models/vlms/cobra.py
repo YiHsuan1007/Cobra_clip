@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Type, Union
 
 import torch
+import torch.nn as nn
 from PIL import Image
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -24,7 +25,7 @@ from cobra.models.backbones.llm.prompting import PromptBuilder
 from cobra.models.backbones.vision import VisionBackbone
 from cobra.models.vlms.base_vlm import VLM
 from cobra.overwatch import initialize_overwatch
-from cobra.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector, FusedLDPProjector
+from cobra.utils.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector, FusedLDPProjector
 from cobra.models.mamba.modeling_mamba import GenerationMixin as MambaGenerationMixin
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
@@ -67,6 +68,9 @@ class CobraVLM(VLM):
             self.projector = FusedLDPProjector(vision_backbone.embed_dim, llm_backbone.embed_dim)
         else:
             raise ValueError(f"CobraVLM with `{arch_specifier = }` is not supported!")
+
+        # Tap point exposed for percentile observers after multimodal fusion.
+        self.tap_post_mm_out = nn.Identity()
 
         # Trackers
         self.vision_backbone_requires_grad = False
@@ -420,6 +424,8 @@ class CobraVLM(VLM):
             fused_labels = torch.vstack([multimodal_labels, unimodal_labels])
 
         # Run LLM Forward --> returns CausalLMOutputWithPast!
+        fused_embeddings = self.tap_post_mm_out(fused_embeddings)
+
         return self.llm_backbone(
             input_ids=None,
             attention_mask=None,

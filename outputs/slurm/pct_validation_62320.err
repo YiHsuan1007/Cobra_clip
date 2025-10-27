@@ -1,0 +1,24 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/asdf1234/cobra/cobra/calibrate/calibrate_run.py", line 17, in <module>
+    from cobra.switches import quant_pct
+  File "/work/asdf1234/cobra/cobra/switches/quant_pct.py", line 24, in <module>
+    from cobra.quantize.rotations import apply_wht_then_klt, compute_klt_from_stats, fold_rotation_into_linear
+  File "/work/asdf1234/cobra/cobra/quantize/rotations/__init__.py", line 3, in <module>
+    from .klt import apply_wht_then_klt, compute_klt_from_stats, fold_rotation_into_linear
+  File "/work/asdf1234/cobra/cobra/quantize/rotations/klt.py", line 10, in <module>
+    from ..hadamard_utils import is_pow2, matmul_hadU
+  File "/work/asdf1234/cobra/cobra/quantize/hadamard_utils.py", line 2, in <module>
+    import fast_hadamard_transform
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/fast_hadamard_transform/__init__.py", line 3, in <module>
+    from fast_hadamard_transform.fast_hadamard_transform_interface import hadamard_transform
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/fast_hadamard_transform/fast_hadamard_transform_interface.py", line 13, in <module>
+    import fast_hadamard_transform_cuda
+ImportError: /lib64/libm.so.6: version `GLIBC_2.29' not found (required by /work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/fast_hadamard_transform_cuda.cpython-310-x86_64-linux-gnu.so)

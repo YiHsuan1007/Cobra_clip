@@ -20,9 +20,9 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from cobra.models.vlms import CobraVLM
 from cobra.overwatch import initialize_overwatch
 from cobra.training.metrics import Metrics
-from cobra.util import check_bloat16_supported
-from cobra.util.batching_utils import SplitModalitySampler
-from cobra.util.data_utils import PaddedCollatorForLanguageModeling, IGNORE_INDEX
+from cobra.utils import check_bloat16_supported
+from cobra.utils.batching_utils import SplitModalitySampler
+from cobra.utils.data_utils import PaddedCollatorForLanguageModeling, IGNORE_INDEX
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)

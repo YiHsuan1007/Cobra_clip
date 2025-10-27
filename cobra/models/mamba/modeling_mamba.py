@@ -269,7 +269,18 @@ class Block(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 eps=self.norm.eps,
             )
-        hidden_states = self.mixer(hidden_states, inference_params=inference_params)
+        if (
+            inference_params is not None
+            and getattr(inference_params, "seqlen_offset", 0) > 0
+            and hidden_states.shape[1] != 1
+        ):
+            # Fallback to token-wise stepping when decode mode unexpectedly receives >1 tokens.
+            chunks = []
+            for token in hidden_states.split(1, dim=1):
+                chunks.append(self.mixer(token, inference_params=inference_params))
+            hidden_states = torch.cat(chunks, dim=1)
+        else:
+            hidden_states = self.mixer(hidden_states, inference_params=inference_params)
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
@@ -518,3 +529,4 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
 
 AutoConfig.register("mamba", MambaConfig)
 AutoModelForCausalLM.register(MambaConfig, MambaForCausalLM)
+

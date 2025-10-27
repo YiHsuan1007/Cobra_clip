@@ -30,7 +30,7 @@ from cobra.models import get_llm_backbone_and_tokenizer, get_vision_backbone_and
 from cobra.overwatch import initialize_overwatch
 from cobra.preprocessing import get_dataset_and_collator
 from cobra.training import Metrics, get_train_strategy
-from cobra.util import set_global_seed
+from cobra.utils import set_global_seed
 
 # Disable Tokenizers Parallelism to Play Nice w/ PyTorch Multiprocessing DataLoaders
 os.environ["TOKENIZERS_PARALLELISM"] = "false"

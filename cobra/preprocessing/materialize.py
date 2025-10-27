@@ -13,7 +13,7 @@ from cobra.conf import DatasetConfig
 from cobra.models.backbones.llm.prompting import PromptBuilder
 from cobra.models.backbones.vision import ImageTransform
 from cobra.preprocessing.datasets import AlignDataset, FinetuneDataset
-from cobra.util.data_utils import PaddedCollatorForLanguageModeling
+from cobra.utils.data_utils import PaddedCollatorForLanguageModeling
 
 # Dataset Initializers =>> Maps Stage --> cls()
 DATASET_INITIALIZER = {"align": AlignDataset, "finetune": FinetuneDataset, "full-finetune": FinetuneDataset}
