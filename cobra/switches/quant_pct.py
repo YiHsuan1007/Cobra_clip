@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+import inspect
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -55,6 +56,12 @@ _Batch = Any
 _Args = Tuple[Any, ...]
 _Kwargs = Dict[str, Any]
 _ForwardExtractor = Callable[[Any], Tuple[_Args, _Kwargs]]
+
+try:
+    _QUANT_LINEAR_PARAMS = inspect.signature(QuantLinear.__init__).parameters
+    _QUANT_LINEAR_SUPPORTS_BITS = {"weight_bits", "act_bits"}.issubset(_QUANT_LINEAR_PARAMS.keys())
+except (TypeError, ValueError):
+    _QUANT_LINEAR_SUPPORTS_BITS = True
 
 
 # Percentile clipping helpers -------------------------------------------------------------------
@@ -170,25 +177,117 @@ def disable(model) -> None:
 # Quantization switchboard helpers --------------------------------------------------------------
 
 """
-def replace_linear_layers(module: nn.Module, cfg) -> None:
+def _make_quant_linear(
+    base_module: nn.Linear,
+    *,
+    weight_bits: int,
+    act_bits: int,
+    weight_quant_params: Optional[Dict[str, Any]] = None,
+    act_quant_params: Optional[Dict[str, Any]] = None,
+    disable_input_quant: bool = False,
+    observe: Optional[str] = None,
+) -> QuantLinear:
+    """Instantiate ``QuantLinear`` with backward-compatible keyword handling."""
+
+    resolved_weight_bits = 8 if weight_bits is None else int(weight_bits)
+    resolved_act_bits = 8 if act_bits is None else int(act_bits)
+
+    weight_params = dict(weight_quant_params or {})
+    act_params = dict(act_quant_params or {})
+
+    common_kwargs: Dict[str, Any] = {
+        "weight_quant_params": weight_params or None,
+        "act_quant_params": act_params or None,
+        "disable_input_quant": disable_input_quant,
+    }
+    if observe is not None:
+        common_kwargs["observe"] = observe
+
+    if _QUANT_LINEAR_SUPPORTS_BITS:
+        quant_layer = QuantLinear(
+            base_module,
+            weight_bits=resolved_weight_bits,
+            act_bits=resolved_act_bits,
+            **common_kwargs,
+        )
+    else:
+        if not weight_params:
+            weight_params = {"dynamic_method": "per_tensor"}
+        weight_params.setdefault("n_bits", resolved_weight_bits)
+        weight_params.setdefault("shape", base_module.weight.shape)
+        weight_params.setdefault("is_weight", True)
+
+        if disable_input_quant:
+            act_params = {}
+        elif not act_params:
+            act_params = {"dynamic_method": "per_tensor"}
+        if act_params:
+            act_params.setdefault("n_bits", resolved_act_bits)
+            act_params.setdefault("has_batch_dim", True)
+
+        fallback_kwargs: Dict[str, Any] = {
+            "weight_quant_params": weight_params,
+            "act_quant_params": act_params,
+            "disable_input_quant": disable_input_quant,
+        }
+        if observe is not None:
+            fallback_kwargs["observe"] = observe
+
+        quant_layer = QuantLinear(
+            base_module,
+            **fallback_kwargs,
+        )
+
+    if not hasattr(quant_layer, "weight_bits"):
+        quant_layer.weight_bits = resolved_weight_bits  # type: ignore[attr-defined]
+    if not hasattr(quant_layer, "act_bits"):
+        quant_layer.act_bits = resolved_act_bits  # type: ignore[attr-defined]
+    if not hasattr(quant_layer, "_origin_linear"):
+        quant_layer._origin_linear = base_module  # type: ignore[attr-defined]
+
+    return quant_layer
+
+
+def replace_linear_layers(
+    module: nn.Module,
+    cfg,
+    *,
+    weight_bits: Optional[int] = None,
+    act_bits: Optional[int] = None,
+) -> None:
     """
     Recursively replace nn.Linear modules with QuantLinear instances.
-    The helper expects cfg to expose weight_bits and activation_bits attributes.
+
+    The helper expects ``cfg`` to expose ``weight_bits`` / ``act_bits`` attributes, but callers
+    can override the values explicitly via the keyword arguments.
     """
 
-    weight_bits = int(getattr(cfg, 'weight_bits', getattr(cfg, 'wbits', 8)))
-    act_bits = int(getattr(cfg, 'act_bits', getattr(cfg, 'abits', 8)))
+    resolved_weight_bits = int(
+        weight_bits if weight_bits is not None else getattr(cfg, "weight_bits", getattr(cfg, "wbits", 8))
+    )
+    resolved_act_bits = int(
+        act_bits if act_bits is not None else getattr(cfg, "act_bits", getattr(cfg, "abits", 8))
+    )
 
     for name, child in list(module.named_children()):
+        if isinstance(child, QuantLinear):
+            continue
+
         if isinstance(child, nn.Linear) and not isinstance(child, QuantLinear):
-            quant_layer = QuantLinear(
+            quant_layer = _make_quant_linear(
                 child,
-                weight_bits=weight_bits,
-                act_bits=act_bits,
+                weight_bits=resolved_weight_bits,
+                act_bits=resolved_act_bits,
             )
             setattr(module, name, quant_layer)
-            child = quant_layer
-        replace_linear_layers(child, cfg)
+            continue
+
+        replace_linear_layers(
+            child,
+            cfg,
+            weight_bits=resolved_weight_bits,
+            act_bits=resolved_act_bits,
+        )
 
 # 10/27新增：替換其他層的量化包裝版本
 def replace_other_layers(module: nn.Module, cfg: Any) -> None:
@@ -283,10 +382,9 @@ def replace_other_layers(module: nn.Module, cfg: Any) -> None:
         # 繼續向下遞迴
         replace_other_layers(child, cfg)
 
-"""
+
 def enable_quant(model: nn.Module, **cfg: Any) -> nn.Module:
-    """#Replace supported layers with their quantized counterparts.
-"""
+    """Replace supported layers with their quantized counterparts."""
 
     weight_quant_params = dict(cfg.get("weight_quant_params", {"dynamic_method": "per_tensor"}))
     act_quant_params = dict(cfg.get("act_quant_params", {"dynamic_method": "per_tensor"}))
@@ -300,23 +398,33 @@ def enable_quant(model: nn.Module, **cfg: Any) -> nn.Module:
 
     observe_token = observer_cfg["activation"]["name"]
 
-    weight_bits = cfg.get("weight_bits", cfg.get("wbits", 8))
-    activation_bits = cfg.get("activation_bits", cfg.get("abits", 8))
-    weight_bits = 8 if weight_bits is None else int(weight_bits)
-    activation_bits = 8 if activation_bits is None else int(activation_bits)
+    def _resolve_bits(value_map: Dict[str, Any], primary: str, *aliases: str, default: int = 8) -> int:
+        for key in (primary, *aliases):
+            candidate = value_map.get(key)
+            if candidate is not None:
+                return int(candidate)
+        bits_block = value_map.get("bits")
+        if isinstance(bits_block, dict):
+            for key in ("weight", "weights") if primary == "weight_bits" else ("activation", "act", "activations"):
+                candidate = bits_block.get(key)
+                if candidate is not None:
+                    return int(candidate)
+        return default
+
+    weight_bits = _resolve_bits(cfg, "weight_bits", "wbits")
+    act_bits = _resolve_bits(cfg, "act_bits", "abits", "activation_bits")
 
     for parent, name, child in _walk_named_children(model):
         if isinstance(child, nn.Linear) and not isinstance(child, QuantLinear):
-            quant_layer = QuantLinear(
+            quant_layer = _make_quant_linear(
                 child,
                 weight_quant_params=weight_quant_params,
                 act_quant_params=act_quant_params,
                 disable_input_quant=disable_input_quant,
                 observe=observe_token,
-                w_bits=weight_bits,
-                a_bits=activation_bits,
+                weight_bits=weight_bits,
+                act_bits=act_bits,
             )
-            quant_layer._origin_linear = child  # type: ignore[attr-defined]
             setattr(parent, name, quant_layer)
             child = quant_layer
 
@@ -334,7 +442,7 @@ def enable_quant(model: nn.Module, **cfg: Any) -> nn.Module:
 
     return model
 
-
+"""
 def calibrate_quantization(
     model: nn.Module,
     data_iter: Iterable[_Batch],
