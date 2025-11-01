@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
+import types
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import inspect
 import torch
@@ -21,12 +23,24 @@ from cobra.integration.hooks import (
 from cobra.quantize.calibrate import calibrate_model, load_stats
 from cobra.quantize.config import QuantConfig
 from cobra.quantize.int_linear import QuantLinear
-from cobra.quantize.int_conv import QuantConv1d, QuantConv2d, QuantConv3d
-from cobra.quantize.int_matmul import QuantMatMul
+try:
+    from cobra.quantize.int_conv import QuantConv1d, QuantConv2d, QuantConv3d, QuantConvBase
+except ImportError:  # pragma: no cover - fallback when QuantConvBase is unavailable
+    from cobra.quantize.int_conv import QuantConv1d, QuantConv2d, QuantConv3d
+    QuantConvBase = (QuantConv1d, QuantConv2d, QuantConv3d)  # type: ignore[assignment]
+from cobra.quantize.int_matmul import QuantMatMul, QuantMatmulWrapper
 from cobra.quantize.int_others import QuantAdd, QuantSwiglu, QuantSwilu, QuantSoftmax
 from cobra.quantize.observers import PercentileObserver, build_observer
-#from cobra.quantize.rotations import apply_wht_then_klt, compute_klt_from_stats, fold_rotation_into_linear
-from cobra.quantize.utils import set_observing, set_quant_state, set_static_quant
+from cobra.quantize.rotations import apply_wht_then_klt, compute_klt_from_stats, fold_rotation_into_linear
+from cobra.quantize.utils import (
+    convert_to_int as _convert_to_int_utils,
+    enable_observation as _enable_observation_utils,
+    finalize_all_quantizers as _finalize_all_quantizers,
+    iter_named_modules,
+    set_observing,
+    set_quant_state,
+    set_static_quant,
+)
 from cobra.quantize.utils.dtype import force_calib_dtype, scoped_no_autocast
 
 __all__ = [
@@ -36,8 +50,14 @@ __all__ = [
     "enable",
     "disable",
     "replace_linear_layers",
+    "replace_conv_layers",
+    "replace_matmul_layers",
+    "replace_other_layers",
     "enable_quant",
     "disable_all_quant",
+    "convert_to_int",
+    "activate_observers",
+    "finalize_quant_params",
 ]
 
 _HANDLE_ATTR = "_quant_pct_handles"
@@ -64,6 +84,66 @@ except (TypeError, ValueError):
     _QUANT_LINEAR_SUPPORTS_BITS = True
 
 
+def _normalize_target_prefixes(targets: Optional[Sequence[Any]]) -> Optional[Tuple[str, ...]]:
+    if targets is None:
+        return None
+    normalized: List[str] = []
+    for item in targets:
+        candidate: Optional[str] = None
+        if isinstance(item, str):
+            candidate = item.strip()
+        elif isinstance(item, dict):
+            for key in ("module", "name", "target", "path"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidate = value.strip()
+                    break
+        elif hasattr(item, "name"):
+            value = getattr(item, "name", None)
+            if isinstance(value, str):
+                candidate = value.strip()
+        if candidate is None:
+            candidate = str(item).strip()
+        if candidate and candidate not in normalized:
+            normalized.append(candidate)
+    return tuple(normalized) or None
+
+
+def _should_wrap_name(name: str, prefixes: Optional[Sequence[str]]) -> bool:
+    if not prefixes:
+        return True
+    return any(name.startswith(prefix) for prefix in prefixes)
+
+
+def _log_replacement_summary(
+    kind: str,
+    names: Sequence[str],
+    max_expected: Optional[int],
+    raise_on_excess: bool,
+) -> None:
+    count = len(names)
+    preview = ", ".join(names[:10])
+    suffix = f": {preview}" if preview else ""
+    logging.info("[QuantPct][%s] Replaced %d module(s)%s", kind, count, suffix)
+    if max_expected is None:
+        return
+    if count > max_expected:
+        message = (
+            f"[QuantPct][{kind}] Replacement count {count} exceeds calibrated target budget {max_expected}."
+        )
+        if raise_on_excess:
+            raise RuntimeError(message)
+        logging.warning(message)
+
+
+def _get_cfg_value(cfg: Any, key: str, default: Any = None) -> Any:
+    if hasattr(cfg, key):
+        return getattr(cfg, key)
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return default
+
+
 # Percentile clipping helpers -------------------------------------------------------------------
 
 def calibrate_percentiles(
@@ -74,6 +154,16 @@ def calibrate_percentiles(
 ) -> dict:
     """Run calibration and persist observer statistics."""
     return calibrate_model(model, dataloader, cfg, targets=targets)
+
+
+def activate_observers(model: nn.Module) -> None:
+    """Enable observation on quantization wrappers."""
+    _enable_observation_utils(model)
+
+
+def finalize_quant_params(model: nn.Module) -> None:
+    """Finalize quantizer parameters prior to real-int execution."""
+    _finalize_all_quantizers(model)
 
 
 def _build_observer(state: dict, cfg: QuantConfig, target: str) -> PercentileObserver:
@@ -175,7 +265,6 @@ def disable(model) -> None:
 
 """
 # Quantization switchboard helpers --------------------------------------------------------------
-
 """
 def _make_quant_linear(
     base_module: nn.Linear,
@@ -248,13 +337,144 @@ def _make_quant_linear(
     return quant_layer
 
 
+def _make_quant_conv(
+    base_module: nn.Module,
+    *,
+    weight_bits: int,
+    act_bits: int,
+    weight_quant_params: Optional[Dict[str, Any]] = None,
+    act_quant_params: Optional[Dict[str, Any]] = None,
+    disable_input_quant: bool = False,
+    observe: Optional[str] = None,
+) -> nn.Module:
+    """Instantiate a quantized convolution module matching ``base_module``."""
+    if isinstance(base_module, (QuantConv1d, QuantConv2d, QuantConv3d)):
+        return base_module
+    if not isinstance(base_module, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+        raise TypeError(f"_make_quant_conv expects an nn.Conv module, received {type(base_module)!r}.")
+
+    resolved_weight_bits = 8 if weight_bits is None else int(weight_bits)
+    resolved_act_bits = 8 if act_bits is None else int(act_bits)
+
+    weight_params = dict(weight_quant_params or {"dynamic_method": "per_tensor"})
+    weight_params.setdefault("n_bits", resolved_weight_bits)
+    weight_params.setdefault("shape", base_module.weight.shape)
+    weight_params.setdefault("is_weight", True)
+    if observe is not None:
+        weight_params.setdefault("observe", observe)
+
+    act_params = dict(act_quant_params or {"dynamic_method": "per_tensor"})
+    act_params.setdefault("n_bits", resolved_act_bits)
+    act_params.setdefault("has_batch_dim", True)
+    if observe is not None:
+        act_params.setdefault("observe", observe)
+
+    observe_mode = weight_params.get("observe", act_params.get("observe", observe or "minmax"))
+
+    if isinstance(base_module, nn.Conv1d):
+        quant_layer = QuantConv1d(
+            base_module,
+            weight_quant_params=weight_params,
+            act_quant_params=act_params,
+            observe=observe_mode,
+            disable_input_quant=disable_input_quant,
+        )
+    elif isinstance(base_module, nn.Conv2d):
+        quant_layer = QuantConv2d(
+            base_module,
+            weight_quant_params=weight_params,
+            act_quant_params=act_params,
+            disable_input_quant=disable_input_quant,
+            observe=observe_mode,
+        )
+    else:
+        quant_layer = QuantConv3d(
+            base_module,
+            weight_quant_params=weight_params,
+            act_quant_params=act_params,
+            disable_input_quant=disable_input_quant,
+            observe=observe_mode,
+        )
+
+    quant_layer.weight_bits = resolved_weight_bits  # type: ignore[attr-defined]
+    quant_layer.act_bits = resolved_act_bits  # type: ignore[attr-defined]
+    # Keep a handle to the original conv without registering it as a child to avoid wrapper<->origin cycles.
+    object.__setattr__(quant_layer, "_origin_conv", base_module)  # type: ignore[attr-defined]
+    quant_layer._modules.pop("_origin_conv", None)
+    quant_layer._quant_pct_wrapped = True  # type: ignore[attr-defined]
+    return quant_layer
+
+
+def _make_quant_matmul(
+    base_module: nn.Module,
+    *,
+    act_bits: int,
+    x1_quant_params: Optional[Dict[str, Any]] = None,
+    x2_quant_params: Optional[Dict[str, Any]] = None,
+    observe: Optional[str] = None,
+    disable_act_quant: bool = False,
+    use_act_quant: bool = False,
+) -> QuantMatMul:
+    """Instantiate ``QuantMatMul`` mirroring the behaviour of ``base_module``."""
+    x1_params = dict(x1_quant_params or {"dynamic_method": "per_tensor"})
+    x1_params.setdefault("n_bits", act_bits)
+    x1_params.setdefault("has_batch_dim", True)
+    if observe is not None:
+        x1_params.setdefault("observe", observe)
+
+    x2_params = dict(x2_quant_params or {"dynamic_method": "per_tensor"})
+    x2_params.setdefault("n_bits", act_bits)
+    x2_params.setdefault("has_batch_dim", True)
+    if observe is not None:
+        x2_params.setdefault("observe", observe)
+
+    observe_mode = observe or x1_params.get("observe", x2_params.get("observe", "minmax"))
+    matmul_func = getattr(base_module, "torch_fn", torch.matmul)
+    quant_layer = QuantMatmulWrapper(
+        base_module,
+        x1_quant_params=x1_params,
+        x2_quant_params=x2_params,
+        disable_act_quant=disable_act_quant,
+        observe=observe_mode,
+        matmul_func=matmul_func,
+    )
+    quant_layer.act_bits = act_bits  # type: ignore[attr-defined]
+    quant_layer.use_act_quant = use_act_quant and not disable_act_quant
+    return quant_layer
+
+
+def _is_quant_wrapped(module: nn.Module) -> bool:
+    wrapper_cls = globals().get("QuantMatmulWrapper")
+    if wrapper_cls is not None and isinstance(module, wrapper_cls):
+        return True
+    return bool(getattr(module, "_quant_wrapped", False))
+
+
+def _mark_quant_wrapped(module: nn.Module) -> None:
+    setattr(module, "_quant_wrapped", True)
+
+
+def _is_matmul_module(module: nn.Module) -> bool:
+    wrapper_cls = globals().get("QuantMatmulWrapper")
+    if _is_quant_wrapped(module) or (wrapper_cls is not None and isinstance(module, wrapper_cls)):
+        return False
+    if isinstance(module, QuantMatMul):
+        return False
+    if module.__class__.__name__.lower() == "matmul":
+        return True
+    return getattr(module, "torch_fn", None) is torch.matmul
+
+
 def replace_linear_layers(
     module: nn.Module,
     cfg,
     *,
     weight_bits: Optional[int] = None,
     act_bits: Optional[int] = None,
-) -> None:
+    targets: Optional[Sequence[str]] = None,
+    max_expected: Optional[int] = None,
+    raise_on_excess: bool = False,
+) -> List[str]:
     """
     Recursively replace nn.Linear modules with QuantLinear instances.
 
@@ -269,28 +489,207 @@ def replace_linear_layers(
         act_bits if act_bits is not None else getattr(cfg, "act_bits", getattr(cfg, "abits", 8))
     )
 
-    for name, child in list(module.named_children()):
-        if isinstance(child, QuantLinear):
-            continue
+    cfg_targets = _get_cfg_value(cfg, "targets")
+    prefixes = _normalize_target_prefixes(targets if targets is not None else cfg_targets)
+    if prefixes is not None and max_expected is None:
+        max_expected = len(prefixes)
+    strict_budget = raise_on_excess or bool(_get_cfg_value(cfg, "strict_target_budget", False))
 
-        if isinstance(child, nn.Linear) and not isinstance(child, QuantLinear):
-            quant_layer = _make_quant_linear(
-                child,
-                weight_bits=resolved_weight_bits,
-                act_bits=resolved_act_bits,
-            )
-            setattr(module, name, quant_layer)
-            continue
+    replacements: List[str] = []
 
-        replace_linear_layers(
-            child,
-            cfg,
-            weight_bits=resolved_weight_bits,
-            act_bits=resolved_act_bits,
-        )
+    def _walk(current: nn.Module, prefix: str) -> None:
+        for child_name, child in list(current.named_children()):
+            if isinstance(child, QuantLinear):
+                continue
+            fq_name = f"{prefix}.{child_name}" if prefix else child_name
+            if isinstance(child, nn.Linear) and not isinstance(child, QuantLinear):
+                if _should_wrap_name(fq_name, prefixes):
+                    quant_layer = _make_quant_linear(
+                        child,
+                        weight_bits=resolved_weight_bits,
+                        act_bits=resolved_act_bits,
+                    )
+                    setattr(current, child_name, quant_layer)
+                    replacements.append(fq_name)
+                    continue
+            _walk(child, fq_name)
+
+    _walk(module, "")
+    _log_replacement_summary("Linear", replacements, max_expected, strict_budget)
+    return replacements
 
 # 10/27新增：替換其他層的量化包裝版本
-def replace_other_layers(module: nn.Module, cfg: Any) -> None:
+
+
+def _collect_conv_targets(root: nn.Module) -> List[Tuple[nn.Module, str, nn.Conv2d, str]]:
+    """Depth-first search for unwrapped Conv2d modules."""
+    targets: List[Tuple[nn.Module, str, nn.Conv2d, str]] = []
+    visited: Set[int] = set()
+
+    def _dfs(module: nn.Module, path: str) -> None:
+        module_id = id(module)
+        if module_id in visited:  # visited prevents revisiting the same module through different parents.
+            return
+        visited.add(module_id)
+
+        for name, child in module.named_children():
+            if getattr(child, "_quant_pct_wrapped", False):  # wrapped flag short-circuits newly created quant layers.
+                continue
+            if isinstance(child, QuantConvBase):
+                continue
+            fq_name = f"{path}.{name}" if path else name
+            if isinstance(child, nn.Conv2d):
+                targets.append((module, name, child, fq_name))
+                continue
+            _dfs(child, fq_name)
+
+    _dfs(root, "")
+    return targets
+
+
+def replace_conv_layers(
+    module: nn.Module,
+    cfg,
+    *,
+    weight_bits: Optional[int] = None,
+    act_bits: Optional[int] = None,
+    disable_input_quant: Optional[bool] = None,
+    observe: Optional[str] = None,
+    targets: Optional[Sequence[str]] = None,
+    max_expected: Optional[int] = None,
+    raise_on_excess: bool = False,
+) -> List[str]:
+    """Replace convolution modules with quantized variants."""
+
+    resolved_weight_bits = int(
+        weight_bits if weight_bits is not None else getattr(cfg, "weight_bits", getattr(cfg, "wbits", 8))
+    )
+    resolved_act_bits = int(
+        act_bits if act_bits is not None else getattr(cfg, "act_bits", getattr(cfg, "abits", 8))
+    )
+    disable_inputs = disable_input_quant if disable_input_quant is not None else bool(
+        getattr(cfg, "disable_input_quant", False)
+    )
+    observe_mode = observe or getattr(cfg, "conv_observer", getattr(cfg, "observe", None))
+
+    weight_qp = getattr(cfg, "conv_weight_quant_params", None)
+    if weight_qp is None:
+        weight_qp = getattr(cfg, "weight_quant_params", None)
+    act_qp = getattr(cfg, "conv_act_quant_params", None)
+    if act_qp is None:
+        act_qp = getattr(cfg, "act_quant_params", getattr(cfg, "a_quant_params", None))
+
+    # Collect once and swap in-place so we never recurse into freshly wrapped layers.
+    cfg_targets = _get_cfg_value(cfg, "targets")
+    prefixes = _normalize_target_prefixes(targets if targets is not None else cfg_targets)
+    if prefixes is not None and max_expected is None:
+        max_expected = len(prefixes)
+    strict_budget = raise_on_excess or bool(_get_cfg_value(cfg, "strict_target_budget", False))
+
+    replacements: List[str] = []
+    conv_targets = _collect_conv_targets(module)
+    for parent, name, conv, fq_name in conv_targets:
+        if not _should_wrap_name(fq_name, prefixes):
+            continue
+        quant_layer = _make_quant_conv(
+            conv,
+            weight_bits=resolved_weight_bits,
+            act_bits=resolved_act_bits,
+            weight_quant_params=weight_qp,
+            act_quant_params=act_qp,
+            disable_input_quant=disable_inputs,
+            observe=observe_mode,
+        )
+        setattr(parent, name, quant_layer)
+        replacements.append(fq_name)
+
+    _ensure_triplet_named_modules(module)
+    _log_replacement_summary("Conv", replacements, max_expected, strict_budget)
+    return replacements
+
+
+def replace_matmul_layers(
+    module: nn.Module,
+    cfg: Any,
+    *,
+    act_bits: Optional[int] = None,
+    disable_act_quant: Optional[bool] = None,
+    observe: Optional[str] = None,
+    visited: Optional[Set[int]] = None,
+    targets: Optional[Sequence[str]] = None,
+    max_expected: Optional[int] = None,
+    raise_on_excess: bool = False,
+) -> List[str]:
+    """Recursively replace MatMul helpers with ``QuantMatMul``."""
+
+    resolved_act_bits = int(act_bits if act_bits is not None else getattr(cfg, "act_bits", getattr(cfg, "abits", 8)))
+    disable_outputs = disable_act_quant if disable_act_quant is not None else bool(
+        getattr(cfg, "matmul_disable_act_quant", False)
+    )
+    observe_mode = observe or getattr(cfg, "matmul_observer", getattr(cfg, "observe", None))
+
+    x1_qp = getattr(cfg, "matmul_x1_quant_params", None)
+    if x1_qp is None:
+        x1_qp = getattr(cfg, "x1_quant_params", None)
+    x2_qp = getattr(cfg, "matmul_x2_quant_params", None)
+    if x2_qp is None:
+        x2_qp = getattr(cfg, "x2_quant_params", None)
+
+    use_act_quant = bool(
+        getattr(cfg, "matmul_act_quant", getattr(cfg, "act_quant", getattr(cfg, "enable_act_quant", False)))
+    )
+
+    if visited is None:
+        visited = set()
+
+    cfg_targets = _get_cfg_value(cfg, "targets")
+    prefixes = _normalize_target_prefixes(targets if targets is not None else cfg_targets)
+    if prefixes is not None and max_expected is None:
+        max_expected = len(prefixes)
+    strict_budget = raise_on_excess or bool(_get_cfg_value(cfg, "strict_target_budget", False))
+
+    targets_list: List[Tuple[nn.Module, str, nn.Module, str]] = []
+
+    def _dfs(current: nn.Module, path: str) -> None:
+        module_id = id(current)
+        if module_id in visited:
+            return
+        visited.add(module_id)
+
+        for name, child in list(current.named_children()):
+            if _is_quant_wrapped(child):
+                continue
+            if isinstance(child, QuantMatMul):
+                continue
+            fq_name = f"{path}.{name}" if path else name
+            if _is_matmul_module(child):
+                if _should_wrap_name(fq_name, prefixes):
+                    targets_list.append((current, name, child, fq_name))
+                    continue
+                _dfs(child, fq_name)
+                continue
+            _dfs(child, fq_name)
+
+    _dfs(module, "")
+
+    replacements: List[str] = []
+    for parent, name, target, fq_name in targets_list:
+        quant_layer = _make_quant_matmul(
+            target,
+            act_bits=resolved_act_bits,
+            x1_quant_params=x1_qp,
+            x2_quant_params=x2_qp,
+            observe=observe_mode,
+            disable_act_quant=disable_outputs,
+            use_act_quant=use_act_quant,
+        )
+        _mark_quant_wrapped(quant_layer)
+        setattr(parent, name, quant_layer)
+        replacements.append(fq_name)
+    _log_replacement_summary("MatMul", replacements, max_expected, strict_budget)
+    return replacements
+
+def replace_other_layers(module: nn.Module, cfg: Any, visited: Optional[Set[int]] = None) -> None:
     """
     遞迴替換「其他」層為量化包裝版本：
       - nn.Softmax            -> QuantSoftmax
@@ -308,6 +707,13 @@ def replace_other_layers(module: nn.Module, cfg: Any) -> None:
       - swilu_quant: bool
     若不存在則採用安全預設。
     """
+
+    if visited is None:
+        visited = set()
+    key = id(module)
+    if key in visited:
+        return
+    visited.add(key)
 
     # 讀取參數與開關（提供後備鍵以兼容不同命名）
     act_qp: Dict[str, Any] = dict(getattr(cfg, "act_quant_params", getattr(cfg, "a_quant_params", {})))
@@ -327,11 +733,12 @@ def replace_other_layers(module: nn.Module, cfg: Any) -> None:
             return False
         return any(k in name for k in ("add", "residualadd", "skipadd"))
 
-    def _is_swiglu_like(m: nn.Module) -> bool:
-        name = m.__class__.__name__.lower()
+    def _is_swiglu_like(m: nn.Module, name: str) -> bool:
         if isinstance(m, QuantSwiglu):
             return False
-        return "swiglu" in name or "swiglu" in getattr(m, "__qualname__", "").lower()
+        cls_name = m.__class__.__qualname__.lower()
+        nm = name.lower()
+        return ("swiglu" in nm) or ("swiglu" in cls_name) or ("swi" in cls_name and "glu" in cls_name)
 
     def _is_swilu_like(m: nn.Module) -> bool:
         name = m.__class__.__name__.lower()
@@ -340,11 +747,28 @@ def replace_other_layers(module: nn.Module, cfg: Any) -> None:
         # 常見寫法：Swilu、SiLU-GLU、SwiLU 等
         return ("swilu" in name) or ("silu" in name and "glu" in name)
 
-    for child_name, child in list(module.named_children()):
-        if getattr(child, "_quant_pct_wrapped", False):
-            replace_other_layers(child, cfg)
+    def _rebind_module_aliases(parent: nn.Module, original: nn.Module, updated: nn.Module, primary_name: str) -> None:
+        modules_dict = getattr(parent, "_modules", None)
+        if not isinstance(modules_dict, dict):
+            return
+        for alias, ref in list(modules_dict.items()):
+            if alias == primary_name:
+                continue
+            if ref is original:
+                modules_dict[alias] = updated
+
+    children = list(module.named_children())
+    for child_name, listed_child in children:
+        modules_dict = getattr(module, "_modules", None)
+        if isinstance(modules_dict, dict):
+            current_child = modules_dict.get(child_name)
+        else:
+            current_child = getattr(module, child_name, None)
+        if current_child is None:
             continue
 
+        child = current_child
+        original_child = child
         replaced = False
 
         # 1) Softmax -> QuantSoftmax
@@ -364,7 +788,7 @@ def replace_other_layers(module: nn.Module, cfg: Any) -> None:
             replaced = True
 
         # 3) SwiGLU-like -> QuantSwiglu
-        elif enable_swgl and _is_swiglu_like(child):
+        elif enable_swgl and _is_swiglu_like(child, child_name):
             qswg = QuantSwiglu(x1_quant_params=x1_qp, x2_quant_params=x2_qp, base_module=child)
             qswg.use_act_quant = use_act_quant
             setattr(module, child_name, qswg)
@@ -379,8 +803,21 @@ def replace_other_layers(module: nn.Module, cfg: Any) -> None:
             child = qswl
             replaced = True
 
+        if replaced and child is not original_child:
+            _rebind_module_aliases(module, original_child, child, child_name)
+
         # 繼續向下遞迴
-        replace_other_layers(child, cfg)
+        if getattr(child, "_quant_pct_wrapped", False):
+            continue
+        if child_name.startswith(("_origin", "_original", "_wrapped", "base_module")):
+            continue
+        if getattr(child, "_is_cobra_internal", False):
+            continue
+        if child is module:
+            continue
+        if getattr(child, "_parent_ref", None) is module:
+            continue
+        replace_other_layers(child, cfg, visited)
 
 
 def enable_quant(model: nn.Module, **cfg: Any) -> nn.Module:
@@ -442,18 +879,18 @@ def enable_quant(model: nn.Module, **cfg: Any) -> nn.Module:
 
     return model
 
-"""
+
 def calibrate_quantization(
     model: nn.Module,
     data_iter: Iterable[_Batch],
     **cfg: Any,
 ) -> None:
-    """#Run calibration passes to collect observer statistics.
+    """Run calibration passes to collect observer statistics.
 
-    #The function keeps quantization disabled while observers collect
-    #statistics in full precision and restores the original dtype after the
-    #sweep finishes.
-"""
+    The function keeps quantization disabled while observers collect
+    statistics in full precision and restores the original dtype after the
+    sweep finishes.
+    """
 
     calibration_dtype = cfg.get("calibration_dtype", torch.float32)
     extractor: Optional[_ForwardExtractor] = cfg.get("forward_extractor")
@@ -486,7 +923,7 @@ def calibrate_quantization(
 
     activation_hooks = []
     activation_accumulators: Dict[str, _ActivationAccumulator] = {}
-    for name, module in model.named_modules():
+    for name, module in iter_named_modules(model):
         if isinstance(module, QuantLinear):
             accumulator = _ActivationAccumulator(name)
             activation_accumulators[name] = accumulator
@@ -552,8 +989,7 @@ def calibrate_quantization(
 
 
 def disable_all_quant(model: nn.Module) -> nn.Module:
-    """#Remove quantization wrappers and restore plain ``nn.Linear`` layers.
-"""
+    """Remove quantization wrappers and restore plain ``nn.Linear`` layers."""
 
     set_quant_state(model, weight_quant=False, act_quant=False)
     set_observing(model, False)
@@ -567,11 +1003,68 @@ def disable_all_quant(model: nn.Module) -> nn.Module:
     return model
 
 
+def convert_to_int(
+    model: nn.Module,
+    *,
+    propagate_int: bool = False,
+    use_int_kernel: bool = False,
+) -> nn.Module:
+    """
+    Materialise integer weights for quantised wrappers to enable real-int execution.
+
+    When ``propagate_int`` is set the routine also tags downstream wrappers with the
+    upstream activation quantiser outputs so alternative runtimes can consume integer
+    activations directly.
+    """
+
+    _convert_to_int_utils(model, propagate_int=propagate_int, use_int_kernel=use_int_kernel)
+    return model
+
+
 def _walk_named_children(module: nn.Module) -> Iterator[Tuple[nn.Module, str, nn.Module]]:
     for name, child in list(module.named_children()):
         yield module, name, child
         yield from _walk_named_children(child)
 
+
+def _ensure_triplet_named_modules(module: nn.Module) -> None:
+    if getattr(module, "_quant_pct_named_modules_wrapped", False):
+        return
+
+    original_named_modules = module.named_modules
+
+    def _named_modules_with_dummy_parent(
+        self: nn.Module,
+        memo: Optional[Set[nn.Module]] = None,
+        prefix: str = "",
+        remove_duplicate: bool = True,
+    ) -> Iterator[Any]:
+        stack = inspect.stack()[1:]
+        try:
+            triplet_mode = True
+            if stack:
+                frame_info = stack[0]
+                module_name = frame_info.frame.f_globals.get("__name__", "")
+                if module_name.startswith("torch.nn") and frame_info.function in {
+                    "_named_members",
+                    "named_parameters",
+                    "named_buffers",
+                    "parameters",
+                    "buffers",
+                    "modules",
+                }:
+                    triplet_mode = False
+        finally:
+            del stack
+        for name, child in original_named_modules(memo, prefix, remove_duplicate):
+            if triplet_mode:
+                yield (None, name, child)
+            else:
+                yield (name, child)
+
+    module._quant_pct_named_modules_original = original_named_modules
+    module.named_modules = types.MethodType(_named_modules_with_dummy_parent, module)
+    setattr(module, "_quant_pct_named_modules_wrapped", True)
 
 def _extract_forward_inputs(
     batch: _Batch,
@@ -686,7 +1179,7 @@ def _make_activation_hook(accumulator: "_ActivationAccumulator") -> Callable[[nn
 def _identify_rotation_targets(model: nn.Module, cfg: Dict[str, Any]) -> Tuple[Tuple[str, QuantLinear], ...]:
     patterns = tuple(p.lower() for p in cfg.get("rotation_patterns", ("gate_proj", "out_proj", "matmul")))
     targets = []
-    for name, module in model.named_modules():
+    for name, module in iter_named_modules(model):
         if not isinstance(module, QuantLinear):
             continue
         lname = name.lower()
@@ -751,8 +1244,7 @@ def _apply_rotations(
 
 
 class _ActivationAccumulator:
-    """#Track activation ranges observed during calibration.
-"""
+    """Track activation ranges observed during calibration."""
 
     def __init__(self, module_name: str) -> None:
         self.module_name = module_name
@@ -789,8 +1281,7 @@ class _ActivationAccumulator:
 
 
 class _RotationAccumulator:
-    """#Track second-order statistics for a linear module.
-"""
+    """Track second-order statistics for a linear module."""
 
     def __init__(self, name: str, module: QuantLinear) -> None:
         self.name = name
@@ -929,7 +1420,7 @@ def _finalize_model_quantizers(
 ) -> Tuple[Tuple[str, ...], List[Dict[str, Any]]]:
     summaries: List[str] = []
     records: List[Dict[str, Any]] = []
-    for name, module in model.named_modules():
+    for name, module in iter_named_modules(model):
         if isinstance(module, QuantLinear):
             linear_summaries, linear_records = _finalize_linear_quantizers(
                 name,
@@ -1101,7 +1592,6 @@ def _finalize_quantizer(
     )
 
     return log_line, record
-"""
 
 # Dispatcher ------------------------------------------------------------------------------------
 
@@ -1124,4 +1614,3 @@ def calibrate(model, *args, **kwargs):
             return calibrate_percentiles(model, dataloader, cfg, *args, **remaining_kwargs)
 
     return calibrate_quantization(model, *args, **kwargs)
-

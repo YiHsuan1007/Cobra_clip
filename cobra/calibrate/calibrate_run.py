@@ -4,9 +4,10 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
+import torch.nn as nn
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
@@ -14,9 +15,11 @@ from cobra import load as load_model
 
 from cobra.quantize.calibrate import _cast_float_payload, _extract_text_inputs, _move_to_device
 from cobra.quantize.config import QuantConfig
+from cobra.quantize.quantizer import UniformAffineQuantizer
 from cobra.switches import quant_pct
 from cobra.utils.mem_peak import format_block, gather_peaks, init_peak_track
 from cobra.utils.latency_meter import LatencyMeter
+from cobra.integration.hooks import DEFAULT_PERCENTILE_TARGET_MAP
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
@@ -56,6 +59,104 @@ def _collate(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     return {"pixel_values": torch.stack(pixel_values, dim=0)}
 
 
+def _iter_uniform_quantizers(candidate: Any) -> List[UniformAffineQuantizer]:
+    quantizers: List[UniformAffineQuantizer] = []
+    seen: set[int] = set()
+
+    def _collect(obj: Any) -> None:
+        if obj is None:
+            return
+        obj_id = id(obj)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+        if isinstance(obj, UniformAffineQuantizer):
+            quantizers.append(obj)
+            return
+        if isinstance(obj, dict):
+            for value in obj.values():
+                _collect(value)
+            return
+        if isinstance(obj, (list, tuple, set)):
+            for value in obj:
+                _collect(value)
+            return
+        if isinstance(obj, nn.ModuleDict):
+            for value in obj.values():
+                _collect(value)
+            return
+        if isinstance(obj, (nn.ModuleList, nn.Sequential)):
+            for value in obj:
+                _collect(value)
+
+    _collect(candidate)
+    return quantizers
+
+
+def _tensor_to_python(value: torch.Tensor) -> Any:
+    tensor = value.detach().cpu()
+    if tensor.numel() == 1:
+        return float(tensor.item())
+    return tensor.reshape(-1).tolist()
+
+
+def _format_quantizer_key(module_name: str, role: str, index: int, total: int) -> str:
+    suffix = "" if total <= 1 else f"[{index}]"
+    return f"{module_name}.{role}{suffix}"
+
+
+def _collect_percentile_quantizer_stats(model: nn.Module) -> Dict[str, Dict[str, Any]]:
+    stats: Dict[str, Dict[str, Any]] = {}
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        for role, attr in (("weight", "weight_quantizer"), ("activation", "act_quantizer")):
+            quantizers = [
+                quant
+                for quant in _iter_uniform_quantizers(getattr(module, attr, None))
+                if str(getattr(quant, "mode", "")).lower() == "percentile"
+            ]
+            if not quantizers:
+                continue
+            total = len(quantizers)
+            for idx, quant in enumerate(quantizers):
+                exporter = getattr(quant, "export_percentile_stats", None)
+                if not callable(exporter):
+                    continue
+                payload = exporter()
+                if payload is None:
+                    continue
+                key = _format_quantizer_key(name, role, idx, total)
+                stats[key] = payload
+    return stats
+
+
+def _build_target_stats(stats: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    observers = stats.get("observers", {})
+    export: Dict[str, Dict[str, Any]] = {}
+    for target, state in observers.items():
+        clip = state.get("clip")
+        if clip is None:
+            continue
+        clip_tensor = torch.as_tensor(clip, dtype=torch.float32)
+        entry: Dict[str, Any] = {
+            "mode": "percentile",
+            "percent": float(state.get("p_max", 0.0)),
+            "numel": int(state.get("numel", 0)),
+            "target": target,
+        }
+        module_path = DEFAULT_PERCENTILE_TARGET_MAP.get(target)
+        if module_path is not None:
+            entry["module"] = module_path
+        percent_value = entry["percent"]
+        percent_key = f"p{percent_value:.6g}" if percent_value else "clip"
+        entry[percent_key] = _tensor_to_python(clip_tensor)
+        entry["min"] = _tensor_to_python(-clip_tensor)
+        entry["max"] = _tensor_to_python(clip_tensor)
+        export[f"target::{target}"] = entry
+    return export
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run percentile calibration for Cobra")
     parser.add_argument("--ckpt", required=True, help="Model identifier or local checkpoint directory.")
@@ -78,6 +179,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override activation bit-width used by quantization layers.",
+    )
+    parser.add_argument(
+        "--stats-out",
+        default=None,
+        help="Optional path to export percentile statistics for downstream application.",
     )
     return parser.parse_args()
 
@@ -207,6 +313,14 @@ def main() -> None:
 
     stats = quant_pct.calibrate(model, dataloader, cfg, targets=user_targets)
 
+    if args.stats_out:
+        export_payload = _build_target_stats(stats)
+        export_payload.update(_collect_percentile_quantizer_stats(model))
+        output_path = Path(args.stats_out).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(export_payload, output_path)
+        print(f"[PercentileStats] Exported {len(export_payload)} entries to `{args.stats_out}`.")
+
     observed_targets = stats.get("targets") or []
     sample_summary = ", ".join(
         f"{name}: {stats['observers'][name]['numel']}" for name in observed_targets if name in stats["observers"]
@@ -251,3 +365,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

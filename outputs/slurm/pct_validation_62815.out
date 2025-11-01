@@ -1,0 +1,158 @@
+[Step 1] Calibration with targets: vision.dino,vision.siglip,mm.out
+[QuantConfig] W8A8
+10/28 [20:23:25] INFO     | >> [*] Downloading `cobra+3b from HF Hub  load.py:61
+                 INFO     | >> [*] Found Config =>> Loading &         load.py:73
+                          Freezing cobra+3b with:                               
+                                       Vision Backbone =>>                      
+                          dinosiglip-vit-so-384px                               
+                                       LLM Backbone    =>>                      
+                          mamba-2.8b-zephyr                                     
+                                       Arch Specifier  =>>                      
+                          no-align+fused-gelu-mlp                               
+                                       Checkpoint Path =>>                      
+                          `/home/asdf1234/.cache/huggingface/hub/mode           
+                          ls--han1997--cobra/snapshots/7e3fb02b4f9291           
+                          f6dcc0e9143ada0e5d7239372d/cobra+3b/checkpo           
+                          ints/latest-checkpoint.pt`                            
+                 INFO     | >> [*] Loading Vision Backbone            load.py:82
+                          dinosiglip-vit-so-384px                               
+10/28 [20:23:28] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (timm/vit_large_patch14_reg4_dinov2.lv                
+                          d142m)                                                
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'pytorch_model.bin' (as                               
+                          'model.safetensors'). Loading weights                 
+                          using safetensors.                                    
+                 INFO     | >> Resized position embedding: (37,  pos_embed.py:55
+                          37) to (27, 27).                                      
+10/28 [20:23:32] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (('timm/ViT-SO400M-14-SigLIP-384',                    
+                          'open_clip_pytorch_model.bin'))                       
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'open_clip_pytorch_model.bin' (as                     
+                          'open_clip_model.safetensors'). Loading               
+                          weights using safetensors.                            
+                 INFO     | >> [*] Loading Pretrained LLM             load.py:89
+                          mamba-2.8b-zephyr via HF Transformers                 
+                 INFO     | >>     |=> Building empty mamba LLM  base_llm.py:129
+                          from `xiuyul/mamba-2.8b-zephyr`                       
+10/28 [20:23:54] INFO     | >>     |=> Loading mamba (Fast)      base_llm.py:151
+                          Tokenizer via the AutoTokenizer API                   
+                 INFO     | >> [*] Loading VLM cobra+3b from          load.py:98
+                          Checkpoint; Freezing Weights 🥶                       
+Saved percentile statistics to `outputs/percentile_stats.pt` (vision.dino: 74649600, vision.siglip: 83980800, mm.out: 188416000).
+Average Latency: 159.48 ms/batch (repeat=10)
+
+=== Peak Memory & Runtime ===
+Mode: tensor
+Bits: W8A8
+Percentile: 99.99
+Rotation: hadamard=False, klt=False
+
+CPU Peak RSS: 4.52 GB
+GPU Peaks:
+  - device:0  alloc:7.39 GB  reserved:8.18 GB
+
+Elapsed: 50.08 s
+=============================
+[Step 4] Low-bit percentile clipping sweep
+10/28 [20:24:20] INFO     | >> [*] Downloading `cobra+3b from HF Hub  load.py:61
+                 INFO     | >> [*] Found Config =>> Loading &         load.py:73
+                          Freezing cobra+3b with:                               
+                                       Vision Backbone =>>                      
+                          dinosiglip-vit-so-384px                               
+                                       LLM Backbone    =>>                      
+                          mamba-2.8b-zephyr                                     
+                                       Arch Specifier  =>>                      
+                          no-align+fused-gelu-mlp                               
+                                       Checkpoint Path =>>                      
+                          `/home/asdf1234/.cache/huggingface/hub/mode           
+                          ls--han1997--cobra/snapshots/7e3fb02b4f9291           
+                          f6dcc0e9143ada0e5d7239372d/cobra+3b/checkpo           
+                          ints/latest-checkpoint.pt`                            
+                 INFO     | >> [*] Loading Vision Backbone            load.py:82
+                          dinosiglip-vit-so-384px                               
+10/28 [20:24:23] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (timm/vit_large_patch14_reg4_dinov2.lv                
+                          d142m)                                                
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'pytorch_model.bin' (as                               
+                          'model.safetensors'). Loading weights                 
+                          using safetensors.                                    
+                 INFO     | >> Resized position embedding: (37,  pos_embed.py:55
+                          37) to (27, 27).                                      
+10/28 [20:24:27] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (('timm/ViT-SO400M-14-SigLIP-384',                    
+                          'open_clip_pytorch_model.bin'))                       
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'open_clip_pytorch_model.bin' (as                     
+                          'open_clip_model.safetensors'). Loading               
+                          weights using safetensors.                            
+10/28 [20:24:28] INFO     | >> [*] Loading Pretrained LLM             load.py:89
+                          mamba-2.8b-zephyr via HF Transformers                 
+                 INFO     | >>     |=> Building empty mamba LLM  base_llm.py:129
+                          from `xiuyul/mamba-2.8b-zephyr`                       
+10/28 [20:24:49] INFO     | >>     |=> Loading mamba (Fast)      base_llm.py:151
+                          Tokenizer via the AutoTokenizer API                   
+                 INFO     | >> [*] Loading VLM cobra+3b from          load.py:98
+                          Checkpoint; Freezing Weights 🥶                       
+[LinearQuant] Replacing nn.Linear -> QuantLinear (W8A8)
+[QuantConfig] W8A8
+The cat.
+Average Latency: 27496.93 ms/batch (repeat=1)
+
+=== Peak Memory & Runtime ===
+Mode: apply
+Bits: W8A8
+Percentile: 99.99
+Rotation: hadamard=False, klt=False
+
+CPU Peak RSS: 4.11 GB
+GPU Peaks:
+  - device:0  alloc:7.00 GB  reserved:7.05 GB
+
+Elapsed: 135.29 s
+=============================
+[Step 5] Unit tests for observers and hooks
+============================= test session starts ==============================
+platform linux -- Python 3.10.19, pytest-8.4.2, pluggy-1.6.0
+rootdir: /work/asdf1234/cobra_1028
+configfile: pyproject.toml
+plugins: anyio-4.11.0
+collected 10 items
+
+cobra/tests/test_bits_config.py ..                                       [ 20%]
+cobra/tests/test_clipping.py ...                                         [ 50%]
+cobra/tests/test_hooks_integration.py .                                  [ 60%]
+cobra/tests/test_observers.py ...                                        [ 90%]
+cobra/tests/test_visual_pct.py .                                         [100%]
+
+=============================== warnings summary ===============================
+../miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311
+../miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311
+  /work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+    torch.utils._pytree._register_pytree_node(
+
+../miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249
+  /work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+    warnings.warn(
+
+../miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249
+  /work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+    warnings.warn(
+
+cobra/tests/test_observers.py::test_quant_pct_collect_and_apply[5.0]
+  /work/asdf1234/cobra_1028/cobra/tests/test_observers.py:145: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+    stats = torch.load(stats_path)
+
+cobra/tests/test_observers.py::test_quant_pct_collect_and_apply[5.0]
+  /work/asdf1234/cobra_1028/cobra/quantize/calibrate.py:177: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+    return torch.load(Path(path), map_location="cpu")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 10 passed, 6 warnings in 3.73s ========================
+[Done] Validation artifacts saved in /work/asdf1234/cobra_1028/outputs/pct_validation_62815

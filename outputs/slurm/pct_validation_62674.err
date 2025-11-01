@@ -1,0 +1,28 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/runpy.py", line 187, in _run_module_as_main
+    mod_name, mod_spec, code = _get_module_details(mod_name, _Error)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/runpy.py", line 110, in _get_module_details
+    __import__(pkg_name)
+  File "/work/asdf1234/cobra_1028/cobra/__init__.py", line 1, in <module>
+    from .models import available_model_names, available_models, get_model_description, load
+  File "/work/asdf1234/cobra_1028/cobra/models/__init__.py", line 1, in <module>
+    from .load import available_model_names, available_models, get_model_description, load
+  File "/work/asdf1234/cobra_1028/cobra/models/load.py", line 14, in <module>
+    from cobra.models.materialize import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform
+  File "/work/asdf1234/cobra_1028/cobra/models/materialize.py", line 11, in <module>
+    from cobra.models.backbones.llm import LLMBackbone, MambaLLMBackbone
+  File "/work/asdf1234/cobra_1028/cobra/models/backbones/llm/__init__.py", line 2, in <module>
+    from .mamba import MambaLLMBackbone
+  File "/work/asdf1234/cobra_1028/cobra/models/backbones/llm/mamba.py", line 10, in <module>
+    from cobra.models.mamba.modeling_mamba import MambaForCausalLM
+  File "/work/asdf1234/cobra_1028/cobra/models/mamba/modeling_mamba.py", line 19, in <module>
+    from mamba_ssm.models.mixer_seq_simple import _init_weights
+ModuleNotFoundError: No module named 'mamba_ssm'

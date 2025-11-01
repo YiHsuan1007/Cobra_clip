@@ -1,10 +1,56 @@
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 from .quantizer import UniformAffineQuantizer
+from .int_others import int_conv2d
 
 
-class QuantConv1d(nn.Conv1d):
+def _scale_to_scalar(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
+    scalar = scale.to(device=device, dtype=torch.float32)
+    if scalar.numel() > 1:
+        scalar = scalar.mean()
+    return scalar.reshape(1)
+
+
+def _invalid_scale(scale: Optional[torch.Tensor]) -> bool:
+    if scale is None:
+        return True
+    if scale.numel() == 0:
+        return True
+    if torch.any(scale == 0):
+        return True
+    if not torch.isfinite(scale).all():
+        return True
+    return False
+
+
+def _should_use_int_path(module, act_scale: Optional[torch.Tensor], weight_scale: Optional[torch.Tensor]) -> bool:
+    if _invalid_scale(weight_scale) or _invalid_scale(act_scale):
+        if not getattr(module, "_warned_invalid_scale", False):
+            logging.warning(
+                "%s detected invalid quantization scale; falling back to fake-quant path.",
+                module.__class__.__name__,
+            )
+            module._warned_invalid_scale = True
+        return False
+    return True
+
+
+class QuantConvBase(nn.Module):
+    """Common base for quantized convolution wrappers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._quant_pct_wrapped = True
+        self._observer_enabled = False
+        modules_dict = getattr(self, "_modules", None)
+        if isinstance(modules_dict, dict):
+            modules_dict.pop("_origin_conv", None)
+
+
+class QuantConv1d(QuantConvBase):
     """
     Quantized Module that can perform quantized convolution or normal convolution.
     To activate quantization, please use set_quant_state function.
@@ -17,45 +63,122 @@ class QuantConv1d(nn.Conv1d):
         observe = "minmax",
         disable_input_quant=False,
     ):
-        super().__init__(org_module.in_channels,
-                         org_module.out_channels,
-                         kernel_size=org_module.kernel_size,
-                         stride=org_module.stride,
-                         padding=org_module.padding,
-                         dilation=org_module.dilation,
-                         bias=org_module.bias is not None)
+        super().__init__()
         self.fwd_kwargs = dict()
         self.fwd_func = F.conv1d
-        self.weight=org_module.weight
+        weight_param = nn.Parameter(
+            org_module.weight.detach().clone(),
+            requires_grad=org_module.weight.requires_grad,
+        )
+        self.weight = weight_param
+        bias_param = None
         if org_module.bias is not None:
-            self.bias=org_module.bias
+            bias_param = nn.Parameter(
+                org_module.bias.detach().clone(),
+                requires_grad=org_module.bias.requires_grad,
+            )
+            self.bias = bias_param
         else:
-            self.bias = None
+            self.register_parameter("bias", None)
         # de-activate the quantized forward default
         self.use_weight_quant = False
         self.use_act_quant = False
         # initialize quantizer
-        self.weight_quantizer = UniformAffineQuantizer(**weight_quant_params,shape=org_module.weight.shape,is_weight=True,observe=observe)
+        weight_params = dict(weight_quant_params or {"dynamic_method": "per_tensor"})
+        weight_params.setdefault("shape", org_module.weight.shape)
+        weight_params.setdefault("is_weight", True)
+        weight_params.setdefault("observe", observe)
+        self.weight_quantizer = UniformAffineQuantizer(**weight_params)
         if not disable_input_quant:
-            self.act_quantizer = UniformAffineQuantizer(**act_quant_params,has_batch_dim=True,observe=observe)
+            act_params = dict(act_quant_params or {"dynamic_method": "per_tensor"})
+            act_params.setdefault("has_batch_dim", True)
+            act_params.setdefault("observe", observe)
+            self.act_quantizer = UniformAffineQuantizer(**act_params)
         else:
             self.act_quantizer = None
 
         self.disable_input_quant = disable_input_quant
         self.use_temporary_parameter = False
+        self.temp_weight: Optional[torch.Tensor] = None
+        self.temp_bias: Optional[torch.Tensor] = None
 
         self.stride = org_module.stride
         self.padding = org_module.padding
         self.dilation = org_module.dilation
         self.groups = org_module.groups
+        self.kernel_size = org_module.kernel_size
+        self.in_channels = org_module.in_channels
+        self.out_channels = org_module.out_channels
+        self.padding_mode = getattr(org_module, "padding_mode", "zeros")
         
         self.weight_quantized = False
+        self.weight_int: Optional[torch.Tensor] = None
+        self.w_scale: Optional[torch.Tensor] = None
+        self.w_zero: Optional[torch.Tensor] = None
+        self.real_quant_enabled = False
+        self._warned_invalid_scale = False
 
      
     def forward(self, input: torch.Tensor):
+        use_real_quant = (
+            self.real_quant_enabled
+            and self.weight_int is not None
+            and self.w_scale is not None
+            and self.use_act_quant
+            and not self.disable_input_quant
+            and self.act_quantizer is not None
+        )
+        if use_real_quant:
+            x_int, a_scale, a_zero = self.act_quantizer.quant2int(input.detach())
+            if not _should_use_int_path(self, a_scale, self.w_scale):
+                use_real_quant = False
+            else:
+                x_shift = x_int.to(torch.int32)
+                if a_zero is not None:
+                    a_zero_broadcast = torch.broadcast_to(
+                        a_zero.to(device=x_shift.device, dtype=torch.int32),
+                        x_shift.shape,
+                    )
+                    x_shift = x_shift - a_zero_broadcast
+
+                weight_shift = self.weight_int.to(torch.int32)
+                if self.w_zero is not None:
+                    w_zero_broadcast = torch.broadcast_to(
+                        self.w_zero.to(device=weight_shift.device, dtype=torch.int32),
+                        weight_shift.shape,
+                    )
+                    weight_shift = weight_shift - w_zero_broadcast
+
+                y_int = self.fwd_func(
+                    x_shift,
+                    weight_shift,
+                    None,
+                    self.stride,
+                    self.padding,
+                    self.dilation,
+                    self.groups,
+                    **self.fwd_kwargs,
+                )
+
+                act_scale_scalar = _scale_to_scalar(a_scale, input.device)
+                weight_scale_scalar = _scale_to_scalar(self.w_scale, input.device)
+                effective_scale = (act_scale_scalar * weight_scale_scalar).to(input.dtype)
+
+                y_fp = y_int.to(input.dtype) * effective_scale
+                if self.bias is not None:
+                    y_fp = y_fp + self.bias.to(y_fp.dtype)
+                return y_fp
+
+        if self._observer_enabled:
+            with torch.no_grad():
+                self.weight_quantizer(self.weight)
+            if not self.disable_input_quant and self.act_quantizer is not None:
+                with torch.no_grad():
+                    self.act_quantizer(input)
+
         if self.use_temporary_parameter:
             weight = self.temp_weight
-            bias = self.temp_bias.to(weight.dtype)
+            bias = self.temp_bias
         elif self.use_weight_quant:
             if not self.weight_quantized:
                 self.weight = torch.nn.Parameter(self.weight_quantizer(self.weight))
@@ -63,16 +186,20 @@ class QuantConv1d(nn.Conv1d):
                 self.weight_quantized = True
             else:
                 weight = self.weight
-            bias = self.bias.to(weight.dtype)
+            bias = self.bias
         else:
             weight = self.weight
-            bias = self.bias.to(weight.dtype)
+            bias = self.bias
+
+        if weight is None:
+            raise RuntimeError("Temporary weight is not initialised.")
+        bias_tensor = bias.to(weight.dtype) if bias is not None else None
 
         if self.use_act_quant and not self.disable_input_quant:
             input = self.act_quantizer(input)
-        
+
         out = self.fwd_func(
-                input.to(weight.dtype), weight, bias.to(weight.dtype),
+                input.to(weight.dtype), weight, bias_tensor,
                 self.stride,
                 self.padding,
                 self.dilation,
@@ -80,13 +207,58 @@ class QuantConv1d(nn.Conv1d):
                 **self.fwd_kwargs)
         return out
 
-    def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
+    def set_quant_state(
+        self,
+        weight_quant: bool = False,
+        act_quant: bool = False,
+        observer: bool = False,
+    ) -> None:
+        logging.debug(
+            "%s.set_quant_state(w=%s, a=%s, observer=%s)",
+            self.__class__.__name__,
+            weight_quant,
+            act_quant,
+            observer,
+        )
+
+        observer_enabled = bool(observer)
+        if observer_enabled:
+            self._observer_enabled = True
+            self.use_weight_quant = False
+            self.use_act_quant = False
+            self.real_quant_enabled = False
+            self.weight_int = None
+            self.w_scale = None
+            self.w_zero = None
+            if hasattr(self.weight_quantizer, "is_observing"):
+                self.weight_quantizer.is_observing = True
+            if self.act_quantizer is not None and hasattr(self.act_quantizer, "is_observing"):
+                self.act_quantizer.is_observing = True
+            return
+
+        if self._observer_enabled:
+            if hasattr(self.weight_quantizer, "is_observing"):
+                self.weight_quantizer.is_observing = False
+            if self.act_quantizer is not None and hasattr(self.act_quantizer, "is_observing"):
+                self.act_quantizer.is_observing = False
+        self._observer_enabled = False
+
         self.use_weight_quant = weight_quant
         self.use_act_quant = act_quant
 
+        if self.use_weight_quant:
+            with torch.no_grad():
+                q_weight, scale, zero = self.weight_quantizer.quant2int(self.weight.detach())
+                self.weight_int = q_weight.to(torch.int32).detach()
+                self.w_scale = scale.detach()
+                self.w_zero = None if zero is None else zero.detach()
+        else:
+            self.weight_int = None
+            self.w_scale = None
+            self.w_zero = None
 
 
-class QuantConv2d(nn.Conv2d):
+class QuantConv2d(QuantConvBase):
     """
     Quantized Module that can perform quantized convolution or normal convolution.
     To activate quantization, please use set_quant_state function.
@@ -99,26 +271,44 @@ class QuantConv2d(nn.Conv2d):
         disable_input_quant=False,
         observe = "minmax",
     ):
-        super().__init__(org_module.in_channels, org_module.out_channels, org_module.kernel_size,)
+        super().__init__()
         self.fwd_kwargs = dict()
         self.fwd_func = F.conv2d
-        self.weight=org_module.weight
+        weight_param = nn.Parameter(
+            org_module.weight.detach().clone(),
+            requires_grad=org_module.weight.requires_grad,
+        )
+        self.weight = weight_param
+        bias_param = None
         if org_module.bias is not None:
-            self.bias=org_module.bias
+            bias_param = nn.Parameter(
+                org_module.bias.detach().clone(),
+                requires_grad=org_module.bias.requires_grad,
+            )
+            self.bias = bias_param
         else:
-            self.bias = None
+            self.register_parameter("bias", None)
         # de-activate the quantized forward default
         self.use_weight_quant = False
         self.use_act_quant = False
         # initialize quantizer
-        self.weight_quantizer = UniformAffineQuantizer(**weight_quant_params,shape=org_module.weight.shape,is_weight=True,observe=observe)
+        weight_params = dict(weight_quant_params or {"dynamic_method": "per_tensor"})
+        weight_params.setdefault("shape", org_module.weight.shape)
+        weight_params.setdefault("is_weight", True)
+        weight_params.setdefault("observe", observe)
+        self.weight_quantizer = UniformAffineQuantizer(**weight_params)
         if not disable_input_quant:
-            self.act_quantizer = UniformAffineQuantizer(**act_quant_params,has_batch_dim=True,observe=observe)
+            act_params = dict(act_quant_params or {"dynamic_method": "per_tensor"})
+            act_params.setdefault("has_batch_dim", True)
+            act_params.setdefault("observe", observe)
+            self.act_quantizer = UniformAffineQuantizer(**act_params)
         else:
             self.act_quantizer = None
 
         self.disable_input_quant = disable_input_quant
         self.use_temporary_parameter = False
+        self.temp_weight: Optional[torch.Tensor] = None
+        self.temp_bias: Optional[torch.Tensor] = None
 
         self.in_channels = org_module.in_channels
         self.out_channels = org_module.out_channels
@@ -127,9 +317,79 @@ class QuantConv2d(nn.Conv2d):
         self.padding = org_module.padding
         self.dilation = org_module.dilation
         self.groups = org_module.groups
+        self.padding_mode = getattr(org_module, "padding_mode", "zeros")
+        self.weight_int: Optional[torch.Tensor] = None
+        self.w_scale: Optional[torch.Tensor] = None
+        self.w_zero: Optional[torch.Tensor] = None
+        self.real_quant_enabled = False
+        self._warned_invalid_scale = False
 
      
     def forward(self, input: torch.Tensor):
+        use_real_quant = (
+            self.real_quant_enabled
+            and self.weight_int is not None
+            and self.w_scale is not None
+            and self.use_act_quant
+            and not self.disable_input_quant
+            and self.act_quantizer is not None
+        )
+        if use_real_quant:
+            x_int, a_scale, a_zero = self.act_quantizer.quant2int(input.detach())
+            if not _should_use_int_path(self, a_scale, self.w_scale):
+                use_real_quant = False
+            else:
+                if getattr(self, "use_int_kernel", False):
+                    y_fp = int_conv2d(
+                        x_int,
+                        self.weight_int,
+                        a_scale,
+                        self.w_scale,
+                        a_zero=a_zero,
+                        w_zero=self.w_zero,
+                        bias=self.bias,
+                        stride=self.stride,
+                        padding=self.padding,
+                        dilation=self.dilation,
+                        groups=self.groups,
+                    ).to(input.dtype)
+                    return y_fp
+
+                x_shift = x_int.to(torch.int32)
+                if a_zero is not None:
+                    x_shift = x_shift - a_zero.to(device=x_shift.device, dtype=torch.int32)
+
+                weight_shift = self.weight_int.to(torch.int32)
+                if self.w_zero is not None:
+                    weight_shift = weight_shift - self.w_zero.to(device=weight_shift.device, dtype=torch.int32)
+
+                y_int = self.fwd_func(
+                    x_shift,
+                    weight_shift,
+                    None,
+                    self.stride,
+                    self.padding,
+                    self.dilation,
+                    self.groups,
+                    **self.fwd_kwargs,
+                )
+
+                act_scale_scalar = _scale_to_scalar(a_scale, input.device)
+                weight_scale_scalar = _scale_to_scalar(self.w_scale, input.device)
+                effective_scale = (act_scale_scalar * weight_scale_scalar).to(input.dtype)
+
+                y_fp = y_int.to(input.dtype) * effective_scale
+                if self.bias is not None:
+                    y_fp = y_fp + self.bias.to(y_fp.dtype)
+                return y_fp
+
+        if self._observer_enabled:
+            with torch.no_grad():
+                self.weight_quantizer(self.weight)
+            if not self.disable_input_quant and self.act_quantizer is not None:
+                with torch.no_grad():
+                    self.act_quantizer(input)
+
         if self.use_temporary_parameter:
             weight = self.temp_weight
             bias = self.temp_bias
@@ -152,12 +412,57 @@ class QuantConv2d(nn.Conv2d):
                 **self.fwd_kwargs)
         return out
 
-    def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
+    def set_quant_state(
+        self,
+        weight_quant: bool = False,
+        act_quant: bool = False,
+        observer: bool = False,
+    ) -> None:
+        logging.debug(
+            "%s.set_quant_state(w=%s, a=%s, observer=%s)",
+            self.__class__.__name__,
+            weight_quant,
+            act_quant,
+            observer,
+        )
+
+        observer_enabled = bool(observer)
+        if observer_enabled:
+            self._observer_enabled = True
+            self.use_weight_quant = False
+            self.use_act_quant = False
+            self.real_quant_enabled = False
+            self.weight_int = None
+            self.w_scale = None
+            self.w_zero = None
+            if hasattr(self.weight_quantizer, "is_observing"):
+                self.weight_quantizer.is_observing = True
+            if self.act_quantizer is not None and hasattr(self.act_quantizer, "is_observing"):
+                self.act_quantizer.is_observing = True
+            return
+
+        if self._observer_enabled:
+            if hasattr(self.weight_quantizer, "is_observing"):
+                self.weight_quantizer.is_observing = False
+            if self.act_quantizer is not None and hasattr(self.act_quantizer, "is_observing"):
+                self.act_quantizer.is_observing = False
+        self._observer_enabled = False
+
         self.use_weight_quant = weight_quant
         self.use_act_quant = act_quant
-        
 
-class QuantConv3d(nn.Conv3d):
+        if self.use_weight_quant:
+            with torch.no_grad():
+                q_weight, scale, zero = self.weight_quantizer.quant2int(self.weight.detach())
+                self.weight_int = q_weight.to(torch.int32).detach()
+                self.w_scale = scale.detach()
+                self.w_zero = None if zero is None else zero.detach()
+        else:
+            self.weight_int = None
+            self.w_scale = None
+            self.w_zero = None
+
+class QuantConv3d(QuantConvBase):
     """
     Quantized Module that can perform quantized convolution or normal convolution.
     To activate quantization, please use set_quant_state function.
@@ -170,26 +475,44 @@ class QuantConv3d(nn.Conv3d):
         disable_input_quant=False,
         observe = "minmax",
     ):
-        super().__init__(org_module.in_channels, org_module.out_channels, org_module.kernel_size,)
+        super().__init__()
         self.fwd_kwargs = dict()
         self.fwd_func = F.conv3d
-        self.weight=org_module.weight
+        weight_param = nn.Parameter(
+            org_module.weight.detach().clone(),
+            requires_grad=org_module.weight.requires_grad,
+        )
+        self.weight = weight_param
+        bias_param = None
         if org_module.bias is not None:
-            self.bias=org_module.bias
+            bias_param = nn.Parameter(
+                org_module.bias.detach().clone(),
+                requires_grad=org_module.bias.requires_grad,
+            )
+            self.bias = bias_param
         else:
-            self.bias = None
+            self.register_parameter("bias", None)
         # de-activate the quantized forward default
         self.use_weight_quant = False
         self.use_act_quant = False
         # initialize quantizer
-        self.weight_quantizer = UniformAffineQuantizer(**weight_quant_params,shape=org_module.weight.shape,is_weight=True,observe=observe)
+        weight_params = dict(weight_quant_params or {"dynamic_method": "per_tensor"})
+        weight_params.setdefault("shape", org_module.weight.shape)
+        weight_params.setdefault("is_weight", True)
+        weight_params.setdefault("observe", observe)
+        self.weight_quantizer = UniformAffineQuantizer(**weight_params)
         if not disable_input_quant:
-            self.act_quantizer = UniformAffineQuantizer(**act_quant_params,has_batch_dim=True,observe=observe)
+            act_params = dict(act_quant_params or {"dynamic_method": "per_tensor"})
+            act_params.setdefault("has_batch_dim", True)
+            act_params.setdefault("observe", observe)
+            self.act_quantizer = UniformAffineQuantizer(**act_params)
         else:
             self.act_quantizer = None
 
         self.disable_input_quant = disable_input_quant
         self.use_temporary_parameter = False
+        self.temp_weight: Optional[torch.Tensor] = None
+        self.temp_bias: Optional[torch.Tensor] = None
 
         self.in_channels = org_module.in_channels
         self.out_channels = org_module.out_channels
@@ -198,9 +521,67 @@ class QuantConv3d(nn.Conv3d):
         self.padding = org_module.padding
         self.dilation = org_module.dilation
         self.groups = org_module.groups
+        self.kernel_size = org_module.kernel_size
+        self.padding_mode = getattr(org_module, "padding_mode", "zeros")
+        self.weight_int: Optional[torch.Tensor] = None
+        self.w_scale: Optional[torch.Tensor] = None
+        self.w_zero: Optional[torch.Tensor] = None
+        self.real_quant_enabled = False
+        self._warned_invalid_scale = False
 
      
     def forward(self, input: torch.Tensor):
+        use_real_quant = (
+            self.real_quant_enabled
+            and self.weight_int is not None
+            and self.w_scale is not None
+            and self.use_act_quant
+            and not self.disable_input_quant
+            and self.act_quantizer is not None
+        )
+        if use_real_quant:
+            x_int, a_scale, a_zero = self.act_quantizer.quant2int(input.detach())
+            if not _should_use_int_path(self, a_scale, self.w_scale):
+                use_real_quant = False
+            else:
+                x_int = x_int.to(torch.int32)
+                weight_int = self.weight_int.to(torch.int32)
+
+                if a_zero is not None:
+                    x_int = x_int - a_zero.to(device=x_int.device, dtype=torch.int32)
+
+                if self.w_zero is not None:
+                    weight_centered = weight_int - self.w_zero.to(device=weight_int.device, dtype=torch.int32)
+                else:
+                    weight_centered = weight_int
+
+                y_int = self.fwd_func(
+                    x_int,
+                    weight_centered,
+                    None,
+                    self.stride,
+                    self.padding,
+                    self.dilation,
+                    self.groups,
+                    **self.fwd_kwargs,
+                )
+
+                act_scale_scalar = _scale_to_scalar(a_scale, input.device)
+                weight_scale_scalar = _scale_to_scalar(self.w_scale, input.device)
+                effective_scale = (act_scale_scalar * weight_scale_scalar).to(input.dtype)
+
+                y_fp = y_int.to(input.dtype) * effective_scale
+                if self.bias is not None:
+                    y_fp = y_fp + self.bias.to(y_fp.dtype)
+            return y_fp
+
+        if self._observer_enabled:
+            with torch.no_grad():
+                self.weight_quantizer(self.weight)
+            if not self.disable_input_quant and self.act_quantizer is not None:
+                with torch.no_grad():
+                    self.act_quantizer(input)
+
         if self.use_temporary_parameter:
             weight = self.temp_weight
             bias = self.temp_bias
@@ -223,8 +604,53 @@ class QuantConv3d(nn.Conv3d):
                 **self.fwd_kwargs)
         return out
 
-    def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
+    def set_quant_state(
+        self,
+        weight_quant: bool = False,
+        act_quant: bool = False,
+        observer: bool = False,
+    ) -> None:
+        logging.debug(
+            "%s.set_quant_state(w=%s, a=%s, observer=%s)",
+            self.__class__.__name__,
+            weight_quant,
+            act_quant,
+            observer,
+        )
+
+        observer_enabled = bool(observer)
+        if observer_enabled:
+            self._observer_enabled = True
+            self.use_weight_quant = False
+            self.use_act_quant = False
+            self.real_quant_enabled = False
+            self.weight_int = None
+            self.w_scale = None
+            self.w_zero = None
+            if hasattr(self.weight_quantizer, "is_observing"):
+                self.weight_quantizer.is_observing = True
+            if self.act_quantizer is not None and hasattr(self.act_quantizer, "is_observing"):
+                self.act_quantizer.is_observing = True
+            return
+
+        if self._observer_enabled:
+            if hasattr(self.weight_quantizer, "is_observing"):
+                self.weight_quantizer.is_observing = False
+            if self.act_quantizer is not None and hasattr(self.act_quantizer, "is_observing"):
+                self.act_quantizer.is_observing = False
+        self._observer_enabled = False
+
         self.use_weight_quant = weight_quant
         self.use_act_quant = act_quant
 
+        if self.use_weight_quant:
+            with torch.no_grad():
+                q_weight, scale, zero = self.weight_quantizer.quant2int(self.weight.detach())
+                self.weight_int = q_weight.to(torch.int32).detach()
+                self.w_scale = scale.detach()
+                self.w_zero = None if zero is None else zero.detach()
+        else:
+            self.weight_int = None
+            self.w_scale = None
+            self.w_zero = None
 

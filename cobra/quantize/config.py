@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
+import torch
+
 try:
     import yaml
 except ImportError as exc:
@@ -38,9 +40,10 @@ class QuantConfig:
         Default textual prompt used when running calibration without task specific data.
     num_workers:
         Number of dataloader workers.
-    device:
+    device / dtype:
         Optional device override (e.g. "cuda" or "cpu"). If None the script
-        will select cuda when available.
+        will select cuda when available. ``dtype`` controls the calibration
+        tensor dtype and accepts either a torch.dtype instance or a string name.
     weight_bits / act_bits:
         Bit-width used for weight and activation quantisation respectively.
     act_quant:
@@ -63,6 +66,7 @@ class QuantConfig:
     prompt: str = "Describe the image in detail."
     num_workers: int = 4
     device: Optional[str] = None
+    dtype: Optional[Union[str, torch.dtype]] = None
     targets: Optional[Tuple[str, ...]] = None
     weight_bits: int = 8
     act_bits: int = 8
@@ -104,6 +108,11 @@ class QuantConfig:
             raise TypeError("`x1_quant_params` must be a dictionary.")
         if not isinstance(self.x2_quant_params, dict):
             raise TypeError("`x2_quant_params` must be a dictionary.")
+        if self.dtype is not None:
+            try:
+                self.dtype = self._normalize_dtype(self.dtype)
+            except (AttributeError, ValueError, TypeError) as exc:
+                raise TypeError("`dtype` must be a torch.dtype or string dtype name.") from exc
 
     @property
     def percentile(self) -> float:
@@ -132,6 +141,10 @@ class QuantConfig:
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a serialisable dictionary representation."""
+        if isinstance(self.dtype, torch.dtype):
+            dtype_value = str(self.dtype).replace("torch.", "")
+        else:
+            dtype_value = self.dtype
         return {
             "p_max": self.p_max,
             "mode": self.mode,
@@ -142,6 +155,7 @@ class QuantConfig:
             "prompt": self.prompt,
             "num_workers": self.num_workers,
             "device": self.device,
+            "dtype": dtype_value,
             "targets": list(self.targets) if self.targets is not None else None,
             "weight_bits": self.weight_bits,
             "act_bits": self.act_bits,
@@ -153,3 +167,17 @@ class QuantConfig:
             "x1_quant_params": self.x1_quant_params,
             "x2_quant_params": self.x2_quant_params,
         }
+
+    @staticmethod
+    def _normalize_dtype(value: Union[str, torch.dtype]) -> torch.dtype:
+        if isinstance(value, torch.dtype):
+            return value
+        if isinstance(value, str):
+            token = value.strip()
+            if token.startswith("torch."):
+                token = token.split(".", 1)[1]
+            candidate = getattr(torch, token, None)
+            if isinstance(candidate, torch.dtype):
+                return candidate
+        raise ValueError(f"Unrecognised torch dtype {value!r}.")
+

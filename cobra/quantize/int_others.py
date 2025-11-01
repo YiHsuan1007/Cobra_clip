@@ -1,7 +1,125 @@
-import torch,torch.nn as nn,torch.nn.functional as F
-from typing import Optional
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Iterable, Optional, Sequence
 
 from .quantizer import UniformAffineQuantizer
+
+
+def _shift_to_int32(t: torch.Tensor, zero: Optional[torch.Tensor]) -> torch.Tensor:
+    shifted = t.to(torch.int32)
+    if zero is not None:
+        shifted = shifted - zero.to(device=t.device, dtype=torch.int32)
+    return shifted
+
+
+def _prepare_scale(scale: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    scale = scale.to(device=ref.device, dtype=torch.float32)
+    if scale.ndim == 0:
+        return scale
+    if scale.ndim == 1:
+        scale = scale.unsqueeze(0)
+    while scale.ndim < ref.ndim:
+        scale = scale.unsqueeze(-1)
+    return scale
+
+
+def _prepare_bias(bias: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    bias = bias.to(device=ref.device, dtype=ref.dtype)
+    if bias.ndim == 1:
+        view_shape = [1] * ref.ndim
+        view_shape[1] = -1
+        bias = bias.view(*view_shape)
+    return bias
+
+
+def int_conv2d(
+    x_int: torch.Tensor,
+    w_int: torch.Tensor,
+    a_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    a_zero: Optional[torch.Tensor] = None,
+    w_zero: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    stride: int | Sequence[int] = 1,
+    padding: int | Sequence[int] = 0,
+    dilation: int | Sequence[int] = 1,
+    groups: int = 1,
+) -> torch.Tensor:
+    """
+    Integer convolution helper that mirrors the behaviour of an INT8/INT32 kernel with float dequantisation.
+    """
+    x_shift = _shift_to_int32(x_int, a_zero)
+    w_shift = _shift_to_int32(w_int, w_zero)
+
+    y_int = F.conv2d(
+        x_shift,
+        w_shift,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    )
+
+    act_scale = _prepare_scale(a_scale, y_int)
+    weight_scale = _prepare_scale(w_scale, y_int)
+    effective_scale = act_scale * weight_scale
+
+    y_fp = y_int.to(torch.float32) * effective_scale
+    if bias is not None:
+        y_fp = y_fp + _prepare_bias(bias, y_fp)
+    return y_fp
+
+
+def _dequant_tensor(
+    tensor_int: torch.Tensor,
+    scale: torch.Tensor,
+    zero: Optional[torch.Tensor],
+) -> torch.Tensor:
+    shifted = _shift_to_int32(tensor_int, zero)
+    return shifted.to(torch.float32) * scale.to(torch.float32)
+
+
+def int_add(
+    lhs_int: torch.Tensor,
+    rhs_int: torch.Tensor,
+    lhs_scale: torch.Tensor,
+    rhs_scale: torch.Tensor,
+    lhs_zero: Optional[torch.Tensor] = None,
+    rhs_zero: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    lhs = _dequant_tensor(lhs_int, lhs_scale, lhs_zero)
+    rhs = _dequant_tensor(rhs_int, rhs_scale, rhs_zero)
+    return lhs + rhs
+
+
+def int_mul(
+    lhs_int: torch.Tensor,
+    rhs_int: torch.Tensor,
+    lhs_scale: torch.Tensor,
+    rhs_scale: torch.Tensor,
+    lhs_zero: Optional[torch.Tensor] = None,
+    rhs_zero: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    lhs = _dequant_tensor(lhs_int, lhs_scale, lhs_zero)
+    rhs = _dequant_tensor(rhs_int, rhs_scale, rhs_zero)
+    return lhs * rhs
+
+
+def int_cat(
+    tensors_int: Sequence[torch.Tensor],
+    scales: Sequence[torch.Tensor],
+    zeros: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    dim: int = 0,
+) -> torch.Tensor:
+    if zeros is None:
+        zeros = [None] * len(tensors_int)
+    dequantised = [
+        _dequant_tensor(t_int, scale, zero)
+        for t_int, scale, zero in zip(tensors_int, scales, zeros)
+    ]
+    return torch.cat(dequantised, dim=dim)
 
 
 
@@ -18,9 +136,12 @@ class QuantAdd(nn.Module):
         self.x1_quantizer = UniformAffineQuantizer(**(x1_quant_params or {}))
         self.x2_quantizer = UniformAffineQuantizer(**(x2_quant_params or {}))
         self.use_act_quant = False
-        self.base_module = base_module
+        object.__setattr__(self, "base_module", base_module)
+        if "base_module" in self._modules:
+            self._modules.pop("base_module", None)
         if base_module is not None:
             setattr(base_module, "_quant_pct_wrapped", True)
+        self._is_cobra_internal = True
         self._quant_pct_wrapped = True
 
     def forward(self, *inputs, **kwargs):
@@ -47,7 +168,7 @@ class QuantAdd(nn.Module):
         self.use_act_quant = act_quant
         if self.base_module is not None and hasattr(self.base_module, "set_quant_state"):
             self.base_module.set_quant_state(weight_quant, act_quant)
-    
+
 
 class QuantSoftmax(nn.Module):
     def __init__(
@@ -59,12 +180,15 @@ class QuantSoftmax(nn.Module):
     ) -> None:
         super().__init__()
         self.act_quantizer = UniformAffineQuantizer(**(act_quant_params or {}))
-        self.base_module = base_module
+        object.__setattr__(self, "base_module", base_module)
+        if "base_module" in self._modules:
+            self._modules.pop("base_module", None)
         if base_module is not None:
             setattr(base_module, "_quant_pct_wrapped", True)
             dim = getattr(base_module, "dim", dim)
         self.dim = dim
         self.use_act_quant = False
+        self._is_cobra_internal = True
         self._quant_pct_wrapped = True
 
     def forward(self, attn_weights, attention_mask=None, *extra_args, **kwargs):
@@ -101,11 +225,14 @@ class QuantSwiglu(nn.Module):
         self.x1_quantizer = UniformAffineQuantizer(**(x1_quant_params or {}))
         self.x2_quantizer = UniformAffineQuantizer(**(x2_quant_params or {}))
         self.use_act_quant = False
-        self.base_module = base_module
+        object.__setattr__(self, "base_module", base_module)
+        if "base_module" in self._modules:
+            self._modules.pop("base_module", None)
         if base_module is not None:
             setattr(base_module, "_quant_pct_wrapped", True)
         self.smooth = getattr(base_module, "smooth", None)
         self.extra_scale = getattr(base_module, "s", None)
+        self._is_cobra_internal = True
         self._quant_pct_wrapped = True
 
     def forward(self, *inputs, **kwargs):
@@ -156,10 +283,13 @@ class QuantSwilu(nn.Module):
         self.x1_quantizer = UniformAffineQuantizer(**(x1_quant_params or {}))
         self.x2_quantizer = UniformAffineQuantizer(**(x2_quant_params or {}))
         self.use_act_quant = False
-        self.base_module = base_module
+        object.__setattr__(self, "base_module", base_module)
+        if "base_module" in self._modules:
+            self._modules.pop("base_module", None)
         if base_module is not None:
             setattr(base_module, "_quant_pct_wrapped", True)
         self.smooth = getattr(base_module, "smooth", None)
+        self._is_cobra_internal = True
         self._quant_pct_wrapped = True
 
     def forward(self, *inputs, **kwargs):
