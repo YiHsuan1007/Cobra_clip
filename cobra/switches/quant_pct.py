@@ -1614,4 +1614,3 @@ def calibrate(model, *args, **kwargs):
             return calibrate_percentiles(model, dataloader, cfg, *args, **remaining_kwargs)
 
     return calibrate_quantization(model, *args, **kwargs)
-
