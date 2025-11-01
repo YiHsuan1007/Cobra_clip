@@ -1,0 +1,142 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+Invalid -W option ignored: invalid module name: 'pydantic._internal._generate_schema'
+Invalid -W option ignored: invalid module name: 'pydantic._internal._generate_schema'
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+Invalid -W option ignored: invalid module name: 'pydantic._internal._generate_schema'
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/asdf1234/cobra_1028/cobra/calibrate/enable_pct_lowbit.py", line 199, in <module>
+    main()
+  File "/work/asdf1234/cobra_1028/cobra/calibrate/enable_pct_lowbit.py", line 175, in main
+    response = run_inference()
+  File "/work/asdf1234/cobra_1028/cobra/calibrate/enable_pct_lowbit.py", line 173, in run_inference
+    return model.generate(image, prompt_text)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/work/asdf1234/cobra_1028/cobra/models/vlms/cobra.py", line 573, in generate
+    generated_ids = self.mamba_generate(
+  File "/work/asdf1234/cobra_1028/cobra/models/vlms/cobra.py", line 93, in mamba_generate
+    return MambaGenerationMixin.generate(self, *args, **kwargs)
+  File "/work/asdf1234/cobra_1028/cobra/models/mamba/modeling_mamba.py", line 212, in generate
+    output = decode(
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/work/asdf1234/cobra_1028/cobra/models/mamba/modeling_mamba.py", line 170, in decode
+    scores.append(get_logits(sequences[-1], inference_params))
+  File "/work/asdf1234/cobra_1028/cobra/models/mamba/modeling_mamba.py", line 129, in get_logits
+    logits = model(
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/work/asdf1234/cobra_1028/cobra/models/vlms/cobra.py", line 429, in forward
+    return self.llm_backbone(
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/work/asdf1234/cobra_1028/cobra/models/backbones/llm/mamba.py", line 79, in forward
+    output: CausalLMOutputWithPast = self.llm(
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/work/asdf1234/cobra_1028/cobra/models/mamba/modeling_mamba.py", line 503, in forward
+    outputs = self.backbone(input_ids, inputs_embeds, inference_params=inference_params, **backbone_kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/work/asdf1234/cobra_1028/cobra/models/mamba/modeling_mamba.py", line 407, in forward
+    hidden_states, residual = layer(
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/work/asdf1234/cobra_1028/cobra/models/mamba/modeling_mamba.py", line 280, in forward
+    chunks.append(self.mixer(token, inference_params=inference_params))
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/mamba_ssm/modules/mamba_simple.py", line 131, in forward
+    out, _, _ = self.step(hidden_states, conv_state, ssm_state)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/mamba_ssm/modules/mamba_simple.py", line 248, in step
+    y = selective_state_update(
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/mamba_ssm/ops/triton/selective_state_update.py", line 179, in selective_state_update
+    _selective_scan_update_kernel[grid](
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/jit.py", line 345, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/autotuner.py", line 338, in run
+    return self.fn.run(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/autotuner.py", line 338, in run
+    return self.fn.run(*args, **kwargs)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/autotuner.py", line 338, in run
+    return self.fn.run(*args, **kwargs)
+  [Previous line repeated 1 more time]
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/jit.py", line 662, in run
+    kernel = self.compile(
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/compiler/compiler.py", line 240, in compile
+    key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}"
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/compiler/compiler.py", line 109, in hash
+    key = f"{self.fn.cache_key}-{self.attrs.hash()}-{sorted_sig}-{sorted_constants}"
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/jit.py", line 758, in cache_key
+    dependencies_finder.visit(self.parse())
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 418, in visit
+    return visitor(node)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 418, in visit
+    return visitor(node)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/jit.py", line 167, in visit_FunctionDef
+    self.generic_visit(node)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 418, in visit
+    return visitor(node)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 418, in visit
+    return visitor(node)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 426, in generic_visit
+    self.visit(item)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 418, in visit
+    return visitor(node)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/jit.py", line 221, in visit_Assign
+    self.generic_visit(node)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 428, in generic_visit
+    self.visit(value)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 418, in visit
+    return visitor(node)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/jit.py", line 134, in visit_Call
+    for obj in itertools.chain(
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 418, in visit
+    return visitor(node)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/jit.py", line 127, in visit_Call
+    func = self.visit(node.func)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/ast.py", line 418, in visit
+    return visitor(node)
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/triton/runtime/jit.py", line 117, in visit_Attribute
+    return getattr(lhs, node.attr)
+AttributeError: module 'triton.language.math' has no attribute 'log1p'. Did you mean: 'log2'?

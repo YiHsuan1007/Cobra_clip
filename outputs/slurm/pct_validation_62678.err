@@ -1,0 +1,31 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+None of PyTorch, TensorFlow >= 2.0, or Flax have been found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 187, in _run_module_as_main
+    mod_name, mod_spec, code = _get_module_details(mod_name, _Error)
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 110, in _get_module_details
+    __import__(pkg_name)
+  File "/work/asdf1234/cobra_1028/cobra/__init__.py", line 1, in <module>
+    from .models import available_model_names, available_models, get_model_description, load
+  File "/work/asdf1234/cobra_1028/cobra/models/__init__.py", line 1, in <module>
+    from .load import available_model_names, available_models, get_model_description, load
+  File "/work/asdf1234/cobra_1028/cobra/models/load.py", line 14, in <module>
+    from cobra.models.materialize import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform
+  File "/work/asdf1234/cobra_1028/cobra/models/materialize.py", line 11, in <module>
+    from cobra.models.backbones.llm import LLMBackbone, MambaLLMBackbone
+  File "/work/asdf1234/cobra_1028/cobra/models/backbones/llm/__init__.py", line 1, in <module>
+    from .base_llm import LLMBackbone
+  File "/work/asdf1234/cobra_1028/cobra/models/backbones/llm/base_llm.py", line 19, in <module>
+    import torch
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/__init__.py", line 426, in <module>
+    _load_global_deps()
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/__init__.py", line 379, in _load_global_deps
+    raise err
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/__init__.py", line 334, in _load_global_deps
+    ctypes.CDLL(global_deps_lib_path, mode=ctypes.RTLD_GLOBAL)
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/ctypes/__init__.py", line 374, in __init__
+    self._handle = _dlopen(self._name, mode)
+OSError: /work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/lib/libtorch_global_deps.so: cannot open shared object file: No such file or directory

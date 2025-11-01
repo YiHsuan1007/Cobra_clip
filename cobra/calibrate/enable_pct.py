@@ -336,7 +336,7 @@ def main() -> None:
     model = load_model(args.ckpt, hf_token=args.hf_token)
     model.to(device, dtype=dtype)
     quant_pct.replace_other_layers(model, cfg)
-    lat_meter = LatencyMeter(repeat=2)
+    lat_meter = LatencyMeter(repeat=1) # Reduced repeat for quicker profiling
 
     dump_targets = _parse_dump_targets(args.dump_where) if args.dump_activations else set()
     dumper = ActivationDumper(dump_targets) if args.dump_activations else None

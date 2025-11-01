@@ -1,0 +1,39 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/asdf1234/cobra/cobra/calibrate/enable_pct_lowbit.py", line 199, in <module>
+    main()
+  File "/work/asdf1234/cobra/cobra/calibrate/enable_pct_lowbit.py", line 134, in main
+    quant_pct.replace_linear_layers(
+  File "/work/asdf1234/cobra/cobra/switches/quant_pct.py", line 281, in replace_linear_layers
+    replace_linear_layers(
+  File "/work/asdf1234/cobra/cobra/switches/quant_pct.py", line 281, in replace_linear_layers
+    replace_linear_layers(
+  File "/work/asdf1234/cobra/cobra/switches/quant_pct.py", line 281, in replace_linear_layers
+    replace_linear_layers(
+  [Previous line repeated 975 more times]
+  File "/work/asdf1234/cobra/cobra/switches/quant_pct.py", line 274, in replace_linear_layers
+    quant_layer = _make_quant_linear(
+  File "/work/asdf1234/cobra/cobra/switches/quant_pct.py", line 207, in _make_quant_linear
+    quant_layer = QuantLinear(
+  File "/work/asdf1234/cobra/cobra/quantize/int_linear.py", line 51, in __init__
+    self.weight_quantizer = UniformAffineQuantizer(**weight_params)
+  File "/work/asdf1234/cobra/cobra/quantize/quantizer.py", line 116, in __init__
+    self.observer = MinMaxObserver(granularity=granularity)
+  File "/work/asdf1234/cobra/cobra/quantize/observers/observer_abc.py", line 70, in __init__
+    self.granularity = granularity
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1754, in __setattr__
+    super().__setattr__(name, value)
+  File "/work/asdf1234/cobra/cobra/quantize/observers/observer_abc.py", line 88, in granularity
+    self._granularity = value
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1707, in __setattr__
+    if isinstance(value, Parameter):
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/nn/parameter.py", line 10, in __instancecheck__
+    isinstance(instance, torch.Tensor) and getattr(instance, '_is_param', False))
+RecursionError: maximum recursion depth exceeded while calling a Python object

@@ -11,6 +11,14 @@ import os
 import sys
 from .quantizer import UniformAffineQuantizer
 
+
+def _iter_named_modules_safe(module):
+    original = getattr(module, "_quant_pct_named_modules_original", None)
+    if original is not None:
+        yield from original()
+    else:
+        yield from module.named_modules()
+
 class NoHookContext:
     def __init__(self, module):
         self.module = module
@@ -97,7 +105,7 @@ def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
     # setting weight quantization here does not affect actual forward pass
     self.use_weight_quant = weight_quant
     self.use_act_quant = act_quant
-    for name,m in self.named_modules():
+    for name, m in _iter_named_modules_safe(self):
         if isinstance(m, (QuantLinear, QuantMatMul,QuantConv1d,QuantConv2d)):
             m.set_quant_state(weight_quant, act_quant)
 
@@ -109,13 +117,14 @@ def set_static_quant(self, static_quant: bool = False):
 
 def set_static_quant_weight(self, static_quant: bool = False):
     # setting weight quantization here does not affect actual forward pass
-    for name, m in self.named_modules():
+    for name, m in _iter_named_modules_safe(self):
         if "weight" in name:
             if isinstance(m, UniformAffineQuantizer):
                 m.is_dynamic_quant = not static_quant
 
 def set_observing(self, observing: bool = True):
     self.use_observing = observing
-    for name, m in self.named_modules():
+    for name, m in _iter_named_modules_safe(self):
         if isinstance(m, (UniformAffineQuantizer)):
            m.is_observing = observing
+

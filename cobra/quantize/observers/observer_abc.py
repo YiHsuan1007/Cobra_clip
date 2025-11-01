@@ -1,4 +1,4 @@
-import abc, sys, torch, torch.distributed as dist, math
+import abc, sys, torch, torch.distributed as dist, math, weakref
 from typing import *
 from torch.distributed import ReduceOp
 from .quant_param import QuantParam
@@ -73,11 +73,37 @@ class ObserverABC(abc.ABC, torch.nn.Module):
         self.symmetric = True
         self.min_limit = min_limit
         self.max_limit = max_limit
+        self._owner_ref: Optional[weakref.ReferenceType[torch.nn.Module]] = None
+
+    def __setattr__(self, name, value):
+        if name == "owner":
+            self.set_owner(value)
+            return
+        super().__setattr__(name, value)
 
     def align_with(self, *args: Iterable["ObserverABC"]):
         for arg in args:
             if arg is not self:
                 self.align_with_set.add(arg)
+
+    @property
+    def owner(self) -> Optional[torch.nn.Module]:
+        owner_ref = self._owner_ref
+        if owner_ref is None:
+            return None
+        return owner_ref()
+
+    def set_owner(self, module: Optional[torch.nn.Module]) -> None:
+        modules = self.__dict__.get("_modules")
+        if isinstance(modules, dict):
+            modules.pop("owner", None)
+        if module is None:
+            object.__setattr__(self, "_owner_ref", None)
+            return
+        if isinstance(module, weakref.ReferenceType):
+            object.__setattr__(self, "_owner_ref", module)
+            return
+        object.__setattr__(self, "_owner_ref", weakref.ref(module))
 
     @property
     def granularity(self):
@@ -231,3 +257,4 @@ class ObserverABC(abc.ABC, torch.nn.Module):
         pass
 
     # ************************END**********************************#
+

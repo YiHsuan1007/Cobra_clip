@@ -1,0 +1,24 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 187, in _run_module_as_main
+    mod_name, mod_spec, code = _get_module_details(mod_name, _Error)
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/runpy.py", line 110, in _get_module_details
+    __import__(pkg_name)
+  File "/work/asdf1234/cobra_1028/cobra/__init__.py", line 1, in <module>
+    from .models import available_model_names, available_models, get_model_description, load
+  File "/work/asdf1234/cobra_1028/cobra/models/__init__.py", line 1, in <module>
+    from .load import available_model_names, available_models, get_model_description, load
+  File "/work/asdf1234/cobra_1028/cobra/models/load.py", line 14, in <module>
+    from cobra.models.materialize import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform
+  File "/work/asdf1234/cobra_1028/cobra/models/materialize.py", line 11, in <module>
+    from cobra.models.backbones.llm import LLMBackbone, MambaLLMBackbone
+  File "/work/asdf1234/cobra_1028/cobra/models/backbones/llm/__init__.py", line 1, in <module>
+    from .base_llm import LLMBackbone
+  File "/work/asdf1234/cobra_1028/cobra/models/backbones/llm/base_llm.py", line 19, in <module>
+    import torch
+  File "/work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/__init__.py", line 367, in <module>
+    from torch._C import *  # noqa: F403
+ImportError: /work/asdf1234/miniconda3/envs/cobra-1/lib/python3.10/site-packages/torch/lib/libtorch_cpu.so: undefined symbol: iJIT_NotifyEvent
