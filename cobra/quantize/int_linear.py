@@ -42,6 +42,7 @@ class QuantLinear(nn.Linear):
         self.use_temporary_parameter = False
         self.weight_quantized = False
         self.real_quant_enabled = False
+        self._guard_weight_scale_logged = False
 
         self.weight_bits = int(weight_bits)
         self.act_bits = int(act_bits)
@@ -143,11 +144,66 @@ class QuantLinear(nn.Linear):
             bias = bias.to(weight)
         return self.fwd_func(input.to(weight), weight, bias, **self.fwd_kwargs)
 
+    def _resolve_guard_label(self) -> str:
+        cached = getattr(self, "_quant_guard_label", None)
+        if isinstance(cached, str) and cached:
+            return cached
+        for attr in ("_quant_label", "_quant_path", "_module_path", "_logical_path"):
+            candidate = getattr(self, attr, None)
+            if isinstance(candidate, str) and candidate:
+                self._quant_guard_label = candidate
+                return candidate
+        label = self.__class__.__name__
+        self._quant_guard_label = label
+        return label
+
+    def _guard_weight_scale_initialized(self) -> None:
+        quantizer = getattr(self, "weight_quantizer", None)
+        if quantizer is None:
+            return
+        scale = getattr(quantizer, "scale", None)
+        if isinstance(scale, torch.Tensor) and scale.numel() > 0:
+            return
+        weight = getattr(self, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.numel() == 0:
+            return
+
+        initialized = False
+        if hasattr(quantizer, "init_from_weight"):
+            try:
+                quantizer.init_from_weight(weight.detach())
+                scale = getattr(quantizer, "scale", None)
+                initialized = isinstance(scale, torch.Tensor) and scale.numel() > 0
+            except Exception as exc:
+                logging.debug(
+                    "[Guard] init_from_weight failed for %s: %s",
+                    self._resolve_guard_label(),
+                    exc,
+                )
+        if not initialized and hasattr(quantizer, "calculate_qparams"):
+            try:
+                quantizer.calculate_qparams()
+                scale = getattr(quantizer, "scale", None)
+                initialized = isinstance(scale, torch.Tensor) and scale.numel() > 0
+            except Exception as exc:
+                logging.debug(
+                    "[Guard] calculate_qparams failed for %s: %s",
+                    self._resolve_guard_label(),
+                    exc,
+                )
+        if initialized and not getattr(self, "_guard_weight_scale_logged", False):
+            logging.warning(
+                "[Guard] weight quant scale initialized on-demand for %s",
+                self._resolve_guard_label(),
+            )
+            self._guard_weight_scale_logged = True
+
     def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False) -> None:
         self.use_weight_quant = weight_quant
         self.use_act_quant = act_quant
 
         if self.use_weight_quant:
+            self._guard_weight_scale_initialized()
             with torch.no_grad():
                 q_weight, scale, zero = self.weight_quantizer.quant2int(self.weight.detach())
                 self.weight_int = q_weight.to(torch.int32).detach()

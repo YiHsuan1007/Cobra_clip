@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import csv
+import functools
 import json
 import logging
+import numbers
+import re
 import types
+import warnings
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import inspect
 import torch
@@ -32,6 +36,13 @@ from cobra.quantize.int_matmul import QuantMatMul, QuantMatmulWrapper
 from cobra.quantize.int_others import QuantAdd, QuantSwiglu, QuantSwilu, QuantSoftmax
 from cobra.quantize.observers import PercentileObserver, build_observer
 from cobra.quantize.rotations import apply_wht_then_klt, compute_klt_from_stats, fold_rotation_into_linear
+from cobra.quantize.percentile_aliases import (
+    candidate_observer_keys,
+    expand_target_for_hooks,
+    expand_targets_for_hooks,
+    normalize_target_name,
+    normalize_targets,
+)
 from cobra.quantize.utils import (
     convert_to_int as _convert_to_int_utils,
     enable_observation as _enable_observation_utils,
@@ -40,7 +51,9 @@ from cobra.quantize.utils import (
     set_observing,
     set_quant_state,
     set_static_quant,
+    _flatten_quantizer_objects,
 )
+from cobra.quantize.quantizer import UniformAffineQuantizer
 from cobra.quantize.utils.dtype import force_calib_dtype, scoped_no_autocast
 
 __all__ = [
@@ -66,11 +79,16 @@ _OBSERVER_ATTR = "_quant_pct_observers"
 ActivationCallback = Callable[[str, str, object], None]
 
 DEFAULT_TARGETS: Sequence[str] = tuple(DEFAULT_PERCENTILE_TARGETS)
-LEGACY_TARGET_MAP = {
-    "vision.dino": "dino",
-    "vision.siglip": "siglip",
-    "mm.out": "fused",
+LEGACY_TARGET_MAP: Dict[str, str] = {
+    # Early keys
+    "vision.dino": "vision_backbone.dino_featurizer",
+    "vision.siglip": "vision_backbone.siglip_featurizer",
+    "mm.out": "projector.out",
+    # Newly exported keys that still need expansion
+    "vision_backbone.dino": "vision_backbone.dino_featurizer",
+    "vision_backbone.siglip": "vision_backbone.siglip_featurizer",
 }
+logger = logging.getLogger(__name__)
 
 _Batch = Any
 _Args = Tuple[Any, ...]
@@ -109,9 +127,11 @@ def _normalize_target_prefixes(targets: Optional[Sequence[Any]]) -> Optional[Tup
     return tuple(normalized) or None
 
 
-def _should_wrap_name(name: str, prefixes: Optional[Sequence[str]]) -> bool:
+def _should_wrap_name(name: str, prefixes: Optional[Sequence[str]], substring: bool = False) -> bool:
     if not prefixes:
         return True
+    if substring:
+        return any(prefix in name for prefix in prefixes)
     return any(name.startswith(prefix) for prefix in prefixes)
 
 
@@ -120,6 +140,8 @@ def _log_replacement_summary(
     names: Sequence[str],
     max_expected: Optional[int],
     raise_on_excess: bool,
+    *,
+    budget_from_targets: bool = False,
 ) -> None:
     count = len(names)
     preview = ", ".join(names[:10])
@@ -127,13 +149,15 @@ def _log_replacement_summary(
     logging.info("[QuantPct][%s] Replaced %d module(s)%s", kind, count, suffix)
     if max_expected is None:
         return
+    if budget_from_targets and count > max_expected:
+        max_expected = count
     if count > max_expected:
         message = (
-            f"[QuantPct][{kind}] Replacement count {count} exceeds calibrated target budget {max_expected}."
+            f"[QuantPct][{kind}] Replaced {count}; calibrated on {max_expected} nodes; proceed to replay to populate stats."
         )
         if raise_on_excess:
             raise RuntimeError(message)
-        logging.warning(message)
+        logging.info(message)
 
 
 def _get_cfg_value(cfg: Any, key: str, default: Any = None) -> Any:
@@ -142,6 +166,79 @@ def _get_cfg_value(cfg: Any, key: str, default: Any = None) -> Any:
     if isinstance(cfg, dict):
         return cfg.get(key, default)
     return default
+
+
+def _normalize_stat_keys(stats: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Harmonise percentile statistics payload keys to match observer expectations.
+
+    - Promote ``target::<name>`` keys to ``observer::<name>`` entries and bare ``<name>`` keys.
+    - Augment entries with canonical and legacy aliases so downstream lookups succeed.
+    - Preserve original values without mutation.
+    """
+
+    if not isinstance(stats, dict):
+        return stats
+
+    def _alias_variants(name: str) -> List[str]:
+        variants: Set[str] = set()
+        raw = name.strip()
+        if raw:
+            variants.add(raw)
+        canonical = normalize_target_name(raw)
+        if canonical:
+            variants.add(canonical)
+        for legacy_key, mapped in LEGACY_TARGET_MAP.items():
+            if raw == legacy_key or raw == mapped or canonical == legacy_key or canonical == mapped:
+                variants.add(legacy_key)
+                variants.add(mapped)
+        return [entry for entry in variants if entry]
+
+    target_key_values: Dict[str, Any] = {}
+    for key in list(stats.keys()):
+        if not isinstance(key, str) or not key.startswith("target::"):
+            continue
+        suffix = key.split("target::", 1)[1]
+        value = stats[key]
+        target_key_values[suffix] = value
+        for alias in _alias_variants(suffix):
+            observer_key = f"observer::{alias}"
+            if observer_key not in stats:
+                stats[observer_key] = value
+            if alias not in stats:
+                stats[alias] = value
+
+    normalized_observers: Dict[str, Any] = {}
+    observers_obj = stats.get("observers")
+    if isinstance(observers_obj, Mapping):
+        source_items = observers_obj.items()
+    else:
+        source_items = ()
+    for key, value in source_items:
+        if isinstance(key, str):
+            if key.startswith("target::"):
+                suffix = key.split("target::", 1)[1]
+            elif key.startswith("observer::"):
+                suffix = key.split("observer::", 1)[1]
+            else:
+                suffix = key
+        else:
+            suffix = str(key)
+        for alias in _alias_variants(suffix):
+            normalized_observers.setdefault(alias, value)
+            prefixed = f"observer::{alias}"
+            normalized_observers.setdefault(prefixed, value)
+
+    for suffix, value in target_key_values.items():
+        for alias in _alias_variants(suffix):
+            normalized_observers.setdefault(alias, value)
+            prefixed = f"observer::{alias}"
+            normalized_observers.setdefault(prefixed, value)
+
+    if normalized_observers:
+        stats["observers"] = normalized_observers
+
+    return stats
 
 
 # Percentile clipping helpers -------------------------------------------------------------------
@@ -164,6 +261,13 @@ def activate_observers(model: nn.Module) -> None:
 def finalize_quant_params(model: nn.Module) -> None:
     """Finalize quantizer parameters prior to real-int execution."""
     _finalize_all_quantizers(model)
+    try:
+        summaries, _ = _finalize_model_quantizers(model, {}, {})
+    except Exception:
+        logger.debug("[QuantPct] Failed to emit calibration summaries during finalize_quant_params.", exc_info=True)
+        return
+    for line in summaries:
+        print(line)
 
 
 def _build_observer(state: dict, cfg: QuantConfig, target: str) -> PercentileObserver:
@@ -171,23 +275,55 @@ def _build_observer(state: dict, cfg: QuantConfig, target: str) -> PercentileObs
     observer.load_state_dict(state)
     return observer
 
+def normalize_stats_format(raw: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise TypeError("Percentile stats must be a mapping.")
+    if "targets" in raw and "observers" in raw:
+        return raw
+
+    pattern = re.compile(r"^target::(.+)$")
+    observer_entries: Dict[str, Any] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        match = pattern.match(key)
+        if match is None:
+            continue
+        canonical = normalize_target_name(match.group(1))
+        observer_entries[canonical] = value
+
+    if not observer_entries:
+        raise ValueError("Unsupported stats format")
+
+    normalized_targets = sorted(observer_entries.keys())
+    return {"targets": normalized_targets, "observers": observer_entries}
 
 def _collect_observers(
     stats: dict,
     cfg: QuantConfig,
-) -> Dict[str, PercentileObserver]:
+) -> Tuple[Dict[str, PercentileObserver], List[Tuple[str, List[str], List[str]]]]:
+    stats = normalize_stats_format(stats)
     observers = stats.get("observers", {})
-    registered_targets = stats.get("targets") or DEFAULT_TARGETS
+    if not isinstance(observers, Mapping):
+        observers = {}
+    registered_targets = normalize_targets(stats.get("targets") or DEFAULT_TARGETS)
     result: Dict[str, PercentileObserver] = {}
+    missing: List[Tuple[str, List[str], List[str]]] = []
+    available_keys = [str(key) for key in observers.keys()]
     for name in registered_targets:
-        state = observers.get(name)
-        if state is None and name in LEGACY_TARGET_MAP:
-            state = observers.get(LEGACY_TARGET_MAP[name])
+        state = None
+        candidates = list(candidate_observer_keys(name))
+        for candidate in candidates:
+            if candidate in observers:
+                state = observers[candidate]
+                break
         if state is None:
-            raise KeyError(f"Calibration statistics are missing required observer entries for `{name}`.")
-        result[name] = _build_observer(state, cfg, target=name)
-    return result
-
+            canonical_name = normalize_target_name(name)
+            missing.append((canonical_name, candidates, available_keys))
+            continue
+        canonical_name = normalize_target_name(name)
+        result[canonical_name] = _build_observer(state, cfg, target=canonical_name)
+    return result, missing
 
 def enable(
     model,
@@ -196,15 +332,32 @@ def enable(
     mode: str = "apply",
     dumper: Optional[ActivationCallback] = None,
     targets: Optional[Iterable[str]] = None,
+    strict_missing_stats: bool = False,
 ) -> None:
     """Enable percentile clipping by registering forward hooks on ``model``."""
 
     if targets is not None:
-        selected_targets = tuple(targets)
+        requested_targets: Sequence[str] = tuple(targets)
     elif cfg.targets:
-        selected_targets = tuple(cfg.targets)
+        requested_targets = tuple(cfg.targets)
     else:
-        selected_targets = tuple(DEFAULT_TARGETS)
+        requested_targets = tuple(DEFAULT_PERCENTILE_TARGETS)
+
+    canonical_requested = tuple(normalize_targets(requested_targets))
+    hook_targets_sequence = expand_targets_for_hooks(canonical_requested)
+    hook_targets = tuple(hook_targets_sequence)
+    selected_targets = tuple(normalize_targets(hook_targets_sequence))
+
+    skipped_targets = [
+        normalize_target_name(name)
+        for name in canonical_requested
+        if normalize_target_name(name) not in selected_targets
+    ]
+    if skipped_targets:
+        logger.warning(
+            "[QuantPct] Skipping targets without hook mapping: %s",
+            ", ".join(skipped_targets),
+        )
 
     normalized_mode = mode.lower()
     if normalized_mode not in {"apply", "collect", "off"}:
@@ -219,37 +372,89 @@ def enable(
     observer_map: Dict[str, PercentileObserver]
     if normalized_mode == "collect":
         observer_map = {
-            name: PercentileObserver(cfg.p_max, cfg.mode, cfg.max_samples, target=name)
-            for name in selected_targets
+            name: PercentileObserver(
+                cfg.p_max, cfg.mode, cfg.max_samples, target=normalize_target_name(name)
+            )
+            for name in hook_targets
         }
         handles = attach_percentile_hooks(
             model,
             observers=observer_map,
             apply_clipping=False,
-            targets=selected_targets,
+            targets=hook_targets,
             dumper=dumper,
         )
     else:  # apply
         stats = load_stats(cfg.stats_path)
+        stats = normalize_stats_format(stats)
+        targets_preview = stats.get("targets", [])
+        logger.info(
+            "[QuantPct] Loaded stats targets=%d preview=%s",
+            len(targets_preview),
+            ", ".join(list(targets_preview)[:10]),
+        )
         cfg_from_stats = stats.get("config", {})
         cfg.p_max = cfg_from_stats.get("p_max", cfg.p_max)
         cfg.mode = cfg_from_stats.get("mode", cfg.mode)
         cfg.max_samples = cfg_from_stats.get("max_samples", cfg.max_samples)
 
-        observer_map_all = _collect_observers(stats, cfg)
-        try:
-            observer_map = {name: observer_map_all[name] for name in selected_targets}
-        except KeyError as exc:
-            missing = exc.args[0]
-            raise KeyError(f"Observer statistics for target `{missing}` are unavailable in `{cfg.stats_path}`.") from exc
+        observer_map_all, missing_details = _collect_observers(stats, cfg)
+
+        expected_canonical = [normalize_target_name(name) for name in hook_targets]
+        available_canonical = set(observer_map_all.keys())
+        missing_required = [name for name in expected_canonical if name not in available_canonical]
+        hits = len(expected_canonical) - len(missing_required)
+        missing_preview = ", ".join(missing_required[:10]) if missing_required else "<none>"
+        print(
+            "[QuantPct][apply] observer coverage: "
+            f"required={len(expected_canonical)} available={hits} missing={len(missing_required)} "
+            f"missing_preview={missing_preview}"
+        )
+
+        if missing_required:
+            stats_source = getattr(cfg, "stats_path", None)
+            if strict_missing_stats:
+                details_map = {entry[0]: entry[1:] for entry in missing_details}
+                diagnostic_segments = []
+                for missing_name in missing_required:
+                    candidates, available_keys = details_map.get(missing_name, ([], []))
+                    candidate_preview = ", ".join(candidates[:8]) if candidates else "<none>"
+                    available_preview = ", ".join(available_keys[:12]) if available_keys else "<none>"
+                    diagnostic_segments.append(
+                        f"{missing_name} (candidates={candidate_preview}; available={available_preview})"
+                    )
+                detail_msg = "; ".join(diagnostic_segments)
+                raise KeyError(
+                    f"Percentile stats missing required observers for {missing_required} "
+                    f"(source={stats_source}). Diagnostics: {detail_msg}"
+                )
+            else:
+                warnings.warn(
+                    "[QuantPct] Proceeding despite missing percentile observers: "
+                    f"{', '.join(missing_required[:10])}",
+                    RuntimeWarning,
+                )
+
+        available_hook_targets = [
+            name for name in hook_targets if normalize_target_name(name) in available_canonical
+        ]
+        if not available_hook_targets:
+            raise KeyError(
+                "No percentile observers matched the requested hook targets after normalization "
+                f"(source={getattr(cfg, 'stats_path', None)})."
+            )
+
+        observer_map = {
+            name: observer_map_all[normalize_target_name(name)]
+            for name in available_hook_targets
+        }
         handles = attach_percentile_hooks(
             model,
             observers=observer_map,
             apply_clipping=True,
-            targets=selected_targets,
+            targets=available_hook_targets,
             dumper=dumper,
         )
-
     setattr(model, _HANDLE_ATTR, handles)
     setattr(model, _OBSERVER_ATTR, observer_map)
 
@@ -332,7 +537,10 @@ def _make_quant_linear(
     if not hasattr(quant_layer, "act_bits"):
         quant_layer.act_bits = resolved_act_bits  # type: ignore[attr-defined]
     if not hasattr(quant_layer, "_origin_linear"):
-        quant_layer._origin_linear = base_module  # type: ignore[attr-defined]
+        object.__setattr__(quant_layer, "_origin_linear", base_module)  # type: ignore[attr-defined]
+        quant_layer._modules.pop("_origin_linear", None)
+
+    setattr(quant_layer, "_quant_pct_wrapped", True)
 
     return quant_layer
 
@@ -440,6 +648,7 @@ def _make_quant_matmul(
     )
     quant_layer.act_bits = act_bits  # type: ignore[attr-defined]
     quant_layer.use_act_quant = use_act_quant and not disable_act_quant
+    setattr(quant_layer, "_quant_pct_wrapped", True)
     return quant_layer
 
 
@@ -454,15 +663,57 @@ def _mark_quant_wrapped(module: nn.Module) -> None:
     setattr(module, "_quant_wrapped", True)
 
 
+def _matches_torch_matmul(candidate: Any) -> bool:
+    if candidate is None:
+        return False
+    if candidate is torch.matmul:
+        return True
+    if isinstance(candidate, functools.partial):
+        return _matches_torch_matmul(candidate.func)
+    wrapped = getattr(candidate, "__wrapped__", None)
+    if wrapped is not None and wrapped is not candidate:
+        return _matches_torch_matmul(wrapped)
+    name = getattr(candidate, "__name__", "") or ""
+    qual = getattr(candidate, "__qualname__", "") or ""
+    module_name = getattr(candidate, "__module__", "") or ""
+    identifier = " ".join((name, qual, module_name)).lower()
+    return "matmul" in identifier
+
+
 def _is_matmul_module(module: nn.Module) -> bool:
     wrapper_cls = globals().get("QuantMatmulWrapper")
     if _is_quant_wrapped(module) or (wrapper_cls is not None and isinstance(module, wrapper_cls)):
         return False
     if isinstance(module, QuantMatMul):
         return False
-    if module.__class__.__name__.lower() == "matmul":
+    cls_name = module.__class__.__name__.lower()
+    if "matmul" in cls_name:
         return True
-    return getattr(module, "torch_fn", None) is torch.matmul
+    if _matches_torch_matmul(getattr(module, "torch_fn", None)):
+        return True
+    for attr_name in (
+        "functional",
+        "function",
+        "fn",
+        "op",
+        "callable",
+        "call_fn",
+        "base_fn",
+        "inner_fn",
+        "matmul_fn",
+        "matmul",
+    ):
+        if _matches_torch_matmul(getattr(module, attr_name, None)):
+            return True
+    return False
+
+
+def _classify_matmul_candidate(module: nn.Module) -> str:
+    if isinstance(module, (nn.Linear, QuantLinear)):
+        return "linear"
+    if _is_matmul_module(module):
+        return "matmul"
+    return "other"
 
 
 def replace_linear_layers(
@@ -471,7 +722,7 @@ def replace_linear_layers(
     *,
     weight_bits: Optional[int] = None,
     act_bits: Optional[int] = None,
-    targets: Optional[Sequence[str]] = None,
+    targets: Optional[List[str]] = None,
     max_expected: Optional[int] = None,
     raise_on_excess: bool = False,
 ) -> List[str]:
@@ -479,8 +730,10 @@ def replace_linear_layers(
     Recursively replace nn.Linear modules with QuantLinear instances.
 
     The helper expects ``cfg`` to expose ``weight_bits`` / ``act_bits`` attributes, but callers
-    can override the values explicitly via the keyword arguments.
+    can customise the values explicitly via the keyword arguments.
     """
+
+    explicit_targets = list(targets) if targets is not None else None
 
     resolved_weight_bits = int(
         weight_bits if weight_bits is not None else getattr(cfg, "weight_bits", getattr(cfg, "wbits", 8))
@@ -490,18 +743,42 @@ def replace_linear_layers(
     )
 
     cfg_targets = _get_cfg_value(cfg, "targets")
-    prefixes = _normalize_target_prefixes(targets if targets is not None else cfg_targets)
+    prefixes = _normalize_target_prefixes(explicit_targets if explicit_targets is not None else cfg_targets)
+    budget_from_targets = False
     if prefixes is not None and max_expected is None:
         max_expected = len(prefixes)
+        budget_from_targets = True
     strict_budget = raise_on_excess or bool(_get_cfg_value(cfg, "strict_target_budget", False))
+
+    match_prefixes: Optional[List[str]] = list(prefixes) if prefixes is not None else None
+
+    sample_paths: List[str] = []
+    unmatched_samples: List[str] = []
+
+    def _record(path: str) -> None:
+        if len(sample_paths) >= 5:
+            return
+        if path in sample_paths:
+            return
+        sample_paths.append(path)
+
+    def _match(path: str) -> bool:
+        if not match_prefixes:
+            return True
+        return any(path.startswith(prefix) for prefix in match_prefixes)
 
     replacements: List[str] = []
 
     def _walk(current: nn.Module, prefix: str) -> None:
         for child_name, child in list(current.named_children()):
+            fq_name = f"{prefix}.{child_name}" if prefix else child_name
+            _record(fq_name)
+            if getattr(child, "_quant_pct_wrapped", False):
+                continue
             if isinstance(child, QuantLinear):
                 continue
-            fq_name = f"{prefix}.{child_name}" if prefix else child_name
+            if not _match(fq_name):
+                continue
             if isinstance(child, nn.Linear) and not isinstance(child, QuantLinear):
                 if _should_wrap_name(fq_name, prefixes):
                     quant_layer = _make_quant_linear(
@@ -515,16 +792,42 @@ def replace_linear_layers(
             _walk(child, fq_name)
 
     _walk(module, "")
-    _log_replacement_summary("Linear", replacements, max_expected, strict_budget)
+    sample_preview = ", ".join(sample_paths) if sample_paths else "<none>"
+    print(f"[QuantPct][Linear] sample module paths: {sample_preview}")
+    _log_replacement_summary(
+        "Linear",
+        replacements,
+        max_expected,
+        strict_budget,
+        budget_from_targets=budget_from_targets,
+    )
     return replacements
 
 # 10/27新增：替換其他層的量化包裝版本
 
 
-def _collect_conv_targets(root: nn.Module) -> List[Tuple[nn.Module, str, nn.Conv2d, str]]:
+def _collect_conv_targets(
+    root: nn.Module,
+    match_prefixes: Optional[Sequence[str]],
+    sample_paths: Optional[List[str]] = None,
+) -> List[Tuple[nn.Module, str, nn.Conv2d, str]]:
     """Depth-first search for unwrapped Conv2d modules."""
     targets: List[Tuple[nn.Module, str, nn.Conv2d, str]] = []
     visited: Set[int] = set()
+
+    def _record(path: str) -> None:
+        if sample_paths is None:
+            return
+        if len(sample_paths) >= 5:
+            return
+        if path in sample_paths:
+            return
+        sample_paths.append(path)
+
+    def _match(path: str) -> bool:
+        if not match_prefixes:
+            return True
+        return any(path.startswith(prefix) for prefix in match_prefixes)
 
     def _dfs(module: nn.Module, path: str) -> None:
         module_id = id(module)
@@ -533,11 +836,16 @@ def _collect_conv_targets(root: nn.Module) -> List[Tuple[nn.Module, str, nn.Conv
         visited.add(module_id)
 
         for name, child in module.named_children():
-            if getattr(child, "_quant_pct_wrapped", False):  # wrapped flag short-circuits newly created quant layers.
+            if getattr(child, "_quant_pct_wrapped", False):
+                fq_name = f"{path}.{name}" if path else name
+                _record(fq_name)
                 continue
             if isinstance(child, QuantConvBase):
                 continue
             fq_name = f"{path}.{name}" if path else name
+            _record(fq_name)
+            if not _match(fq_name):
+                continue
             if isinstance(child, nn.Conv2d):
                 targets.append((module, name, child, fq_name))
                 continue
@@ -555,11 +863,13 @@ def replace_conv_layers(
     act_bits: Optional[int] = None,
     disable_input_quant: Optional[bool] = None,
     observe: Optional[str] = None,
-    targets: Optional[Sequence[str]] = None,
+    targets: Optional[List[str]] = None,
     max_expected: Optional[int] = None,
     raise_on_excess: bool = False,
 ) -> List[str]:
     """Replace convolution modules with quantized variants."""
+
+    explicit_targets = list(targets) if targets is not None else None
 
     resolved_weight_bits = int(
         weight_bits if weight_bits is not None else getattr(cfg, "weight_bits", getattr(cfg, "wbits", 8))
@@ -581,13 +891,18 @@ def replace_conv_layers(
 
     # Collect once and swap in-place so we never recurse into freshly wrapped layers.
     cfg_targets = _get_cfg_value(cfg, "targets")
-    prefixes = _normalize_target_prefixes(targets if targets is not None else cfg_targets)
+    prefixes = _normalize_target_prefixes(explicit_targets if explicit_targets is not None else cfg_targets)
+    budget_from_targets = False
     if prefixes is not None and max_expected is None:
         max_expected = len(prefixes)
+        budget_from_targets = True
     strict_budget = raise_on_excess or bool(_get_cfg_value(cfg, "strict_target_budget", False))
 
+    match_prefixes: Optional[List[str]] = list(prefixes) if prefixes is not None else None
+    sample_paths: List[str] = []
+
     replacements: List[str] = []
-    conv_targets = _collect_conv_targets(module)
+    conv_targets = _collect_conv_targets(module, match_prefixes, sample_paths)
     for parent, name, conv, fq_name in conv_targets:
         if not _should_wrap_name(fq_name, prefixes):
             continue
@@ -603,8 +918,17 @@ def replace_conv_layers(
         setattr(parent, name, quant_layer)
         replacements.append(fq_name)
 
+    sample_preview = ", ".join(sample_paths) if sample_paths else "<none>"
+    print(f"[QuantPct][Conv] sample module paths: {sample_preview}")
+
     _ensure_triplet_named_modules(module)
-    _log_replacement_summary("Conv", replacements, max_expected, strict_budget)
+    _log_replacement_summary(
+        "Conv",
+        replacements,
+        max_expected,
+        strict_budget,
+        budget_from_targets=budget_from_targets,
+    )
     return replacements
 
 
@@ -615,12 +939,19 @@ def replace_matmul_layers(
     act_bits: Optional[int] = None,
     disable_act_quant: Optional[bool] = None,
     observe: Optional[str] = None,
+    substring_match: bool = False,
     visited: Optional[Set[int]] = None,
-    targets: Optional[Sequence[str]] = None,
+    targets: Optional[List[str]] = None,
     max_expected: Optional[int] = None,
     raise_on_excess: bool = False,
-) -> List[str]:
-    """Recursively replace MatMul helpers with ``QuantMatMul``."""
+) -> int:
+    """
+    Recursively replace MatMul helpers with ``QuantMatMul`` and return the replacement count.
+
+    Set ``substring_match=True`` to treat target filters as substring matches instead of strict prefixes.
+    """
+
+    explicit_targets = list(targets) if targets is not None else None
 
     resolved_act_bits = int(act_bits if act_bits is not None else getattr(cfg, "act_bits", getattr(cfg, "abits", 8)))
     disable_outputs = disable_act_quant if disable_act_quant is not None else bool(
@@ -639,40 +970,88 @@ def replace_matmul_layers(
         getattr(cfg, "matmul_act_quant", getattr(cfg, "act_quant", getattr(cfg, "enable_act_quant", False)))
     )
 
+    traversal_visited: Set[int]
     if visited is None:
-        visited = set()
+        traversal_visited = set()
+    else:
+        traversal_visited = set(visited)
 
     cfg_targets = _get_cfg_value(cfg, "targets")
-    prefixes = _normalize_target_prefixes(targets if targets is not None else cfg_targets)
+    prefixes = _normalize_target_prefixes(explicit_targets if explicit_targets is not None else cfg_targets)
+    budget_from_targets = False
     if prefixes is not None and max_expected is None:
         max_expected = len(prefixes)
+        budget_from_targets = True
     strict_budget = raise_on_excess or bool(_get_cfg_value(cfg, "strict_target_budget", False))
+
+    use_substring = bool(substring_match)
+    match_prefixes: Optional[List[str]] = list(prefixes) if prefixes is not None else None
+    sample_paths: List[str] = []
+    unmatched_samples: list[str] = []
+    replaced = 0
+
+    def _append_unmatched(path: str) -> None:
+        if len(unmatched_samples) >= 20:
+            return
+        if path in unmatched_samples:
+            return
+        unmatched_samples.append(path)
+
+    def _record(path: str) -> None:
+        if len(sample_paths) >= 5:
+            return
+        if path in sample_paths:
+            return
+        sample_paths.append(path)
+
+    def _match(path: str, substring: bool = False) -> bool:
+        if not match_prefixes:
+            return True
+        if substring:
+            return any(prefix in path for prefix in match_prefixes)
+        return any(path.startswith(prefix) for prefix in match_prefixes)
 
     targets_list: List[Tuple[nn.Module, str, nn.Module, str]] = []
 
     def _dfs(current: nn.Module, path: str) -> None:
-        module_id = id(current)
-        if module_id in visited:
-            return
-        visited.add(module_id)
-
         for name, child in list(current.named_children()):
+            child_id = id(child)
+            if child_id in traversal_visited:
+                continue
+            traversal_visited.add(child_id)
+
+            if getattr(child, "_quant_pct_wrapped", False):
+                continue
             if _is_quant_wrapped(child):
                 continue
             if isinstance(child, QuantMatMul):
                 continue
+
             fq_name = f"{path}.{name}" if path else name
-            if _is_matmul_module(child):
-                if _should_wrap_name(fq_name, prefixes):
+            _record(fq_name)
+
+            if not _match(fq_name, use_substring):
+                _append_unmatched(fq_name)
+                _dfs(child, fq_name)
+                continue
+
+            candidate_kind = _classify_matmul_candidate(child)
+            if candidate_kind == "matmul":
+                if _should_wrap_name(fq_name, prefixes, substring=use_substring):
                     targets_list.append((current, name, child, fq_name))
                     continue
+                _append_unmatched(fq_name)
+                _dfs(child, fq_name)
+                continue
+            if candidate_kind == "linear":
+                # Attention blocks often alias matmul as Linear; let the linear pass handle them.
+                _append_unmatched(f"{fq_name} (linear path handled)")
                 _dfs(child, fq_name)
                 continue
             _dfs(child, fq_name)
 
     _dfs(module, "")
 
-    replacements: List[str] = []
     for parent, name, target, fq_name in targets_list:
         quant_layer = _make_quant_matmul(
             target,
@@ -685,9 +1064,32 @@ def replace_matmul_layers(
         )
         _mark_quant_wrapped(quant_layer)
         setattr(parent, name, quant_layer)
-        replacements.append(fq_name)
-    _log_replacement_summary("MatMul", replacements, max_expected, strict_budget)
-    return replacements
+        replaced += 1
+    sample_preview = ", ".join(sample_paths) if sample_paths else "<none>"
+    print(f"[QuantPct][MatMul] sample module paths: {sample_preview}")
+    if replaced == 0 and prefixes and any(p in {"vision_backbone", "llm_backbone", "projector"} for p in prefixes):
+        logger.info("[QuantPct][MatMul] Checked prefixes cover tap_post_mm_out")
+    if max_expected is not None:
+        effective_budget = max_expected
+        if budget_from_targets and replaced > effective_budget:
+            effective_budget = replaced
+        if replaced > effective_budget:
+            message = (
+                f"[QuantPct][MatMul] Replaced {replaced}; calibrated on {effective_budget} nodes; "
+                "proceed to replay to populate stats."
+            )
+            if strict_budget:
+                raise RuntimeError(message)
+            logger.info(message)
+    logger.info("[QuantPct][MatMul] Replaced %d module(s)", replaced)
+    if len(unmatched_samples) > 0:
+        logger.info("[QuantPct][MatMul] Unmatched samples: %s", ", ".join(unmatched_samples))
+    if replaced == 0:
+        logger.info("[MatMulQuant] Skipped (attention uses Linear path)")
+    if visited is not None:
+        visited.clear()
+        visited.update(traversal_visited)
+    return replaced
 
 def replace_other_layers(module: nn.Module, cfg: Any, visited: Optional[Set[int]] = None) -> None:
     """
@@ -1475,6 +1877,26 @@ def _finalize_linear_quantizers(
     return tuple(summaries), records
 
 
+def _reduce_min(value: Any) -> Optional[float]:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return float(value.min().item())
+    if isinstance(value, numbers.Number):
+        return float(value)
+    return None
+
+
+def _reduce_max(value: Any) -> Optional[float]:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return float(value.max().item())
+    if isinstance(value, numbers.Number):
+        return float(value)
+    return None
+
+
 def _finalize_quantizer(
     qualified_name: str,
     quantizer,
@@ -1486,6 +1908,52 @@ def _finalize_quantizer(
     observer_name = getattr(quantizer, "_observer_name", "unknown")
     percentile = None
     if observer is None:
+        cached_min = _reduce_min(getattr(quantizer, "cached_xmin", None))
+        cached_max = _reduce_max(getattr(quantizer, "cached_xmax", None))
+        scale_min = _reduce_min(getattr(quantizer, "scale", None))
+        scale_max = _reduce_max(getattr(quantizer, "scale", None))
+        zero_attr = getattr(quantizer, "round_zero_point", None)
+        if zero_attr is None:
+            zero_attr = getattr(quantizer, "zero_point", None)
+        zero_min = _reduce_min(zero_attr)
+        zero_max = _reduce_max(zero_attr)
+        zero_desc = "None"
+        if zero_min is not None and zero_max is not None:
+            zero_desc = f"[{zero_min:.6g}, {zero_max:.6g}]"
+        raw_percent = getattr(quantizer, "percent", None)
+        if raw_percent is None:
+            raw_percent = getattr(quantizer, "percentile", None)
+        if isinstance(raw_percent, numbers.Number):
+            percentile_desc = f"{float(raw_percent):.6g}"
+        else:
+            percentile_desc = None
+        if scale_min is not None and scale_max is not None:
+            clip_min_val = cached_min if cached_min is not None else -abs(scale_min)
+            clip_max_val = cached_max if cached_max is not None else abs(scale_max)
+            record = {
+                "layer_name": qualified_name,
+                "kind": kind,
+                "observer": observer_name,
+                "percentile": percentile_desc,
+                "clip_min": clip_min_val,
+                "clip_max": clip_max_val,
+                "scale_min": scale_min,
+                "scale_max": scale_max,
+                "zero_point_min": zero_min,
+                "zero_point_max": zero_max,
+                "fold_mode": metadata.get("mode", "none") if metadata else "none",
+                "notes": metadata.get("notes", "") if metadata else "observer_already_frozen",
+            }
+            if metadata:
+                record.update(metadata)
+                if "mode" in record:
+                    record["fold_mode"] = record.pop("mode")
+            log_line = (
+                f"[calibrate] {qualified_name}: observer={observer_name}"
+                + (f", percentile={percentile_desc}" if percentile_desc else "")
+                + f", clip=({clip_min_val:.6g}, {clip_max_val:.6g}), scale=[{scale_min:.6g}, {scale_max:.6g}], zero_point={zero_desc}"
+            )
+            return log_line, record
         record = {
             "layer_name": qualified_name,
             "kind": kind,
@@ -1502,6 +1970,8 @@ def _finalize_quantizer(
         }
         if metadata:
             record.update(metadata)
+            if "mode" in record:
+                record["fold_mode"] = record.pop("mode")
         return f"[calibrate] {qualified_name}: observer={observer_name} already frozen", record
 
     if getattr(observer, "left_percent", None) is not None:
@@ -1614,3 +2084,4 @@ def calibrate(model, *args, **kwargs):
             return calibrate_percentiles(model, dataloader, cfg, *args, **remaining_kwargs)
 
     return calibrate_quantization(model, *args, **kwargs)
+

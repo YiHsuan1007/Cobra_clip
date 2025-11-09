@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -16,12 +16,55 @@ from cobra import load as load_model
 from cobra.quantize.calibrate import _cast_float_payload, _extract_text_inputs, _move_to_device
 from cobra.quantize.config import QuantConfig
 from cobra.quantize.quantizer import UniformAffineQuantizer
+from cobra.quantize.percentile_aliases import normalize_target_name, expand_target_for_hooks
 from cobra.switches import quant_pct
 from cobra.utils.mem_peak import format_block, gather_peaks, init_peak_track
 from cobra.utils.latency_meter import LatencyMeter
 from cobra.integration.hooks import DEFAULT_PERCENTILE_TARGET_MAP
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+_FINAL_TARGET_PREFIX = {
+    "vision_backbone.dino": "vision_backbone.dino_featurizer",
+    "vision_backbone.siglip": "vision_backbone.siglip_featurizer",
+    "projector.out": "projector.out",
+}
+
+_MODULE_PREFIX_REMAP: Dict[str, str] = {}
+for hook_name, module_path in DEFAULT_PERCENTILE_TARGET_MAP.items():
+    canonical = normalize_target_name(hook_name)
+    final_prefix = _FINAL_TARGET_PREFIX.get(canonical)
+    if final_prefix is not None:
+        _MODULE_PREFIX_REMAP[module_path] = final_prefix
+
+
+def _rewrite_module_path(path: str) -> str:
+    for source, target in _MODULE_PREFIX_REMAP.items():
+        if path == source:
+            return target
+        if path.startswith(f"{source}."):
+            suffix = path[len(source) :]
+            return f"{target}{suffix}"
+    return path
+
+
+def _resolve_calibration_targets(raw_targets: Optional[Sequence[str]]) -> Optional[Tuple[str, ...]]:
+    if raw_targets is None:
+        return None
+    expanded: List[str] = []
+    seen: Dict[str, None] = {}
+    for target in raw_targets:
+        canonical = normalize_target_name(target)
+        hook_names = expand_target_for_hooks(canonical)
+        if hook_names:
+            for hook_name in hook_names:
+                if hook_name not in seen:
+                    seen[hook_name] = None
+                    expanded.append(hook_name)
+        else:
+            # No hook mapping available; skip to avoid downstream warnings.
+            continue
+    return tuple(expanded)
 
 
 def _discover_images(root: Path) -> List[Path]:
@@ -110,6 +153,7 @@ def _collect_percentile_quantizer_stats(model: nn.Module) -> Dict[str, Dict[str,
     for name, module in model.named_modules():
         if not name:
             continue
+        rewritten = _rewrite_module_path(name)
         for role, attr in (("weight", "weight_quantizer"), ("activation", "act_quantizer")):
             quantizers = [
                 quant
@@ -126,7 +170,7 @@ def _collect_percentile_quantizer_stats(model: nn.Module) -> Dict[str, Dict[str,
                 payload = exporter()
                 if payload is None:
                     continue
-                key = _format_quantizer_key(name, role, idx, total)
+                key = _format_quantizer_key(rewritten, role, idx, total)
                 stats[key] = payload
     return stats
 
@@ -139,21 +183,24 @@ def _build_target_stats(stats: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         if clip is None:
             continue
         clip_tensor = torch.as_tensor(clip, dtype=torch.float32)
+        canonical = normalize_target_name(target)
         entry: Dict[str, Any] = {
             "mode": "percentile",
             "percent": float(state.get("p_max", 0.0)),
             "numel": int(state.get("numel", 0)),
-            "target": target,
+            "target": canonical,
         }
-        module_path = DEFAULT_PERCENTILE_TARGET_MAP.get(target)
-        if module_path is not None:
-            entry["module"] = module_path
+        for hook_target in expand_target_for_hooks(canonical):
+            module_path = DEFAULT_PERCENTILE_TARGET_MAP.get(hook_target)
+            if module_path is not None:
+                entry["module"] = _rewrite_module_path(module_path)
+                break
         percent_value = entry["percent"]
         percent_key = f"p{percent_value:.6g}" if percent_value else "clip"
         entry[percent_key] = _tensor_to_python(clip_tensor)
         entry["min"] = _tensor_to_python(-clip_tensor)
         entry["max"] = _tensor_to_python(clip_tensor)
-        export[f"target::{target}"] = entry
+        export[f"target::{canonical}"] = entry
     return export
 
 
@@ -219,11 +266,11 @@ def _emit_mem_peak(args, cfg, start_time: float) -> None:
             else:
                 percentile_repr = "mixed"
         if used_fallback:
-            fallback = getattr(cfg, "p_max", getattr(cfg, "percentile", None))
+            fallback = getattr(cfg, "p_max", None)
             if fallback is not None:
                 percentile_repr = str(fallback)
     except Exception:
-        fallback = getattr(cfg, "p_max", getattr(cfg, "percentile", None))
+        fallback = getattr(cfg, "p_max", None)
         percentile_repr = str(fallback) if fallback is not None else "N/A"
 
     weight_bits = str(getattr(cfg, "weight_bits", "?"))
@@ -285,6 +332,7 @@ def main() -> None:
     user_targets = _parse_targets(args.targets)
     if user_targets is not None:
         cfg.targets = tuple(user_targets)
+    calibration_targets = _resolve_calibration_targets(user_targets) if user_targets is not None else None
 
     device = torch.device(cfg.device) if cfg.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -311,7 +359,7 @@ def main() -> None:
         collate_fn=_collate,
     )
 
-    stats = quant_pct.calibrate(model, dataloader, cfg, targets=user_targets)
+    stats = quant_pct.calibrate(model, dataloader, cfg, targets=calibration_targets)
 
     if args.stats_out:
         export_payload = _build_target_stats(stats)

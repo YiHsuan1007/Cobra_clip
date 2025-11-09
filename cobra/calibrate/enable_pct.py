@@ -182,11 +182,11 @@ def _emit_mem_peak(args, cfg, start_time: float) -> None:
             else:
                 percentile_repr = "mixed"
         if used_fallback:
-            fallback = getattr(cfg, "p_max", getattr(cfg, "percentile", None))
+            fallback = getattr(cfg, "p_max", None)
             if fallback is not None:
                 percentile_repr = str(fallback)
     except Exception:
-        fallback = getattr(cfg, "p_max", getattr(cfg, "percentile", None))
+        fallback = getattr(cfg, "p_max", None)
         percentile_repr = str(fallback) if fallback is not None else "N/A"
 
     bits_conf = getattr(cfg, "bits", None)

@@ -1,0 +1,46 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+usage: enable_pct_lowbit.py [-h] --ckpt CKPT --cfg CFG --image IMAGE
+                            --question QUESTION [--hf-token HF_TOKEN]
+                            [--mode {apply,collect,off}]
+                            [--auto-recollect-on-missing]
+                            [--strict-missing-stats] [--calib-data CALIB_DATA]
+                            [--stats-in STATS_IN] [--lazy-init-via-fakequant]
+                            [--dump-activations] [--dump-where DUMP_WHERE]
+                            [--out OUT] [--targets TARGETS] [--repeat REPEAT]
+                            [--warmup WARMUP] [--hf-home HF_HOME]
+                            [--datasets-dir DATASETS_DIR]
+                            [--weight-bits WEIGHT_BITS] [--act-bits ACT_BITS]
+                            [--linear-weight-bits LINEAR_WEIGHT_BITS]
+                            [--linear-act-bits LINEAR_ACT_BITS]
+                            [--skip-linear-replace] [--skip-conv-replace]
+                            [--skip-matmul-replace] [--verbose]
+                            [--conv-weight-bits CONV_WEIGHT_BITS]
+                            [--conv-act-bits CONV_ACT_BITS]
+                            [--matmul-act-bits MATMUL_ACT_BITS]
+                            [--matmul-substring]
+                            [--calib-batches CALIB_BATCHES]
+                            [--calib-steps CALIB_STEPS]
+                            [--calibrate-weight CALIBRATE_WEIGHT]
+                            [--calibrate-act CALIBRATE_ACT] [--skip-recalib]
+                            [--real-quant] [--propagate-int] [--int-kernel]
+                            [--dry-run-real-quant]
+enable_pct_lowbit.py: error: unrecognized arguments: --best-percentile off

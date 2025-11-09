@@ -1,6 +1,7 @@
 """Calibration utilities for percentile-based clipping."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence
 
@@ -9,6 +10,14 @@ from torch.utils.data import DataLoader
 
 from .config import QuantConfig
 from .observers import PercentileObserver
+from .percentile_aliases import (
+    expand_targets_for_hooks,
+    normalize_stats_payload,
+    normalize_target_name,
+    normalize_targets,
+)
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -103,15 +112,30 @@ def calibrate_model(
     model_dtype = reference_param.dtype
     model.eval()
 
-    target_list: Sequence[str]
     if targets is not None:
-        target_list = tuple(targets)
+        requested_targets: Sequence[str] = tuple(targets)
     elif cfg.targets:
-        target_list = tuple(cfg.targets)
+        requested_targets = tuple(cfg.targets)
     else:
         from cobra.integration.hooks import DEFAULT_PERCENTILE_TARGETS  # local import to avoid cycles
 
-        target_list = tuple(DEFAULT_PERCENTILE_TARGETS)
+        requested_targets = tuple(DEFAULT_PERCENTILE_TARGETS)
+
+    canonical_requested = normalize_targets(requested_targets)
+    hook_targets_sequence = expand_targets_for_hooks(canonical_requested)
+    hook_targets: Sequence[str] = tuple(hook_targets_sequence)
+    canonical_targets = tuple(normalize_targets(hook_targets_sequence))
+
+    skipped_targets = [
+        normalize_target_name(name)
+        for name in canonical_requested
+        if normalize_target_name(name) not in canonical_targets
+    ]
+    if skipped_targets:
+        logger.warning(
+            "[PercentileCalib] Skipping targets without hook mapping: %s",
+            ", ".join(skipped_targets),
+        )
 
     def _make_observer(name: str) -> PercentileObserver:
         try:
@@ -122,7 +146,7 @@ def calibrate_model(
                 observer.target = name
             return observer
 
-    observers = {name: _make_observer(name) for name in target_list}
+    observers = {name: _make_observer(name) for name in hook_targets}
 
     from cobra.integration.hooks import attach_percentile_hooks
 
@@ -130,7 +154,7 @@ def calibrate_model(
         model,
         observers=observers,
         apply_clipping=False,
-        targets=target_list,
+        targets=hook_targets,
     )
 
     try:
@@ -158,11 +182,11 @@ def calibrate_model(
         for handle in handles:
             handle.remove()
 
-    stats = {
+    stats = normalize_stats_payload({
         "config": cfg.to_dict(),
-        "targets": list(target_list),
-        "observers": {name: observers[name].state_dict() for name in target_list},
-    }
+        "targets": list(canonical_targets),
+        "observers": {normalize_target_name(name): observers[name].state_dict() for name in hook_targets},
+    })
     save_stats(stats, cfg.stats_path)
     return stats
 

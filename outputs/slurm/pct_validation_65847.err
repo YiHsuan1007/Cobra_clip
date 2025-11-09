@@ -1,0 +1,49 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+The cache for model files in Transformers v4.22.0 has been updated. Migrating your old cache. This is a one-time only operation. You can interrupt this and resume the migration later on by calling `transformers.utils.move_cache()`.
+0it [00:00, ?it/s]0it [00:00, ?it/s]
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+Traceback (most recent call last):
+  File "/work/asdf1234/Cobra_clip/cobra/quantize/int_linear.py", line 127, in _ensure_quantizer_ready
+    scale, zero = quantizer.export_params()
+  File "/work/asdf1234/Cobra_clip/cobra/quantize/quantizer.py", line 713, in export_params
+    raise RuntimeError("Cannot export parameters before scale is initialised.")
+RuntimeError: Cannot export parameters before scale is initialised.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/asdf1234/Cobra_clip/cobra/calibrate/enable_pct_lowbit.py", line 1777, in <module>
+    main()
+  File "/work/asdf1234/Cobra_clip/cobra/calibrate/enable_pct_lowbit.py", line 1434, in main
+    fake_replay_processed, fake_replay_quant_map = _run_fake_quant_calib(
+  File "/work/asdf1234/Cobra_clip/cobra/calibrate/enable_pct_lowbit.py", line 663, in _run_fake_quant_calib
+    _set_quant_state_utils(model, weight_quant=False, act_quant=True)
+  File "/work/asdf1234/Cobra_clip/cobra/quantize/utils/__init__.py", line 114, in set_quant_state
+    m.set_quant_state(weight_quant, act_quant)
+  File "/work/asdf1234/Cobra_clip/cobra/quantize/int_linear.py", line 351, in set_quant_state
+    self._ensure_quantizer_ready(self.act_quantizer, "activation")
+  File "/work/asdf1234/Cobra_clip/cobra/quantize/int_linear.py", line 129, in _ensure_quantizer_ready
+    raise RuntimeError(f"QuantLinear {role} quantizer missing parameters; run calibration first.") from exc
+RuntimeError: QuantLinear activation quantizer missing parameters; run calibration first.
