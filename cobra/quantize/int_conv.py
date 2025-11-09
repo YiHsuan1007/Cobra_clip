@@ -45,9 +45,70 @@ class QuantConvBase(nn.Module):
         super().__init__()
         self._quant_pct_wrapped = True
         self._observer_enabled = False
+        self._guard_weight_scale_logged = False
         modules_dict = getattr(self, "_modules", None)
         if isinstance(modules_dict, dict):
             modules_dict.pop("_origin_conv", None)
+
+    def _resolve_guard_label(self) -> str:
+        cached = getattr(self, "_quant_guard_label", None)
+        if isinstance(cached, str) and cached:
+            return cached
+        for attr in ("_quant_label", "_quant_path", "_module_path", "_logical_path"):
+            candidate = getattr(self, attr, None)
+            if isinstance(candidate, str) and candidate:
+                self._quant_guard_label = candidate
+                return candidate
+        origin = getattr(self, "_origin_conv", None)
+        if origin is not None:
+            origin_label = getattr(origin, "_quant_guard_label", None)
+            if isinstance(origin_label, str) and origin_label:
+                self._quant_guard_label = origin_label
+                return origin_label
+        label = self.__class__.__name__
+        self._quant_guard_label = label
+        return label
+
+    def _guard_weight_scale_initialized(self) -> None:
+        quantizer = getattr(self, "weight_quantizer", None)
+        if quantizer is None:
+            return
+        scale = getattr(quantizer, "scale", None)
+        if isinstance(scale, torch.Tensor) and scale.numel() > 0:
+            return
+        weight = getattr(self, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.numel() == 0:
+            return
+
+        initialized = False
+        if hasattr(quantizer, "init_from_weight"):
+            try:
+                quantizer.init_from_weight(weight.detach())
+                scale = getattr(quantizer, "scale", None)
+                initialized = isinstance(scale, torch.Tensor) and scale.numel() > 0
+            except Exception as exc:
+                logging.debug(
+                    "[Guard] init_from_weight failed for %s: %s",
+                    self._resolve_guard_label(),
+                    exc,
+                )
+        if not initialized and hasattr(quantizer, "calculate_qparams"):
+            try:
+                quantizer.calculate_qparams()
+                scale = getattr(quantizer, "scale", None)
+                initialized = isinstance(scale, torch.Tensor) and scale.numel() > 0
+            except Exception as exc:
+                logging.debug(
+                    "[Guard] calculate_qparams failed for %s: %s",
+                    self._resolve_guard_label(),
+                    exc,
+                )
+        if initialized and not getattr(self, "_guard_weight_scale_logged", False):
+            logging.warning(
+                "[Guard] weight quant scale initialized on-demand for %s",
+                self._resolve_guard_label(),
+            )
+            self._guard_weight_scale_logged = True
 
 
 class QuantConv1d(QuantConvBase):
@@ -247,6 +308,7 @@ class QuantConv1d(QuantConvBase):
         self.use_act_quant = act_quant
 
         if self.use_weight_quant:
+            self._guard_weight_scale_initialized()
             with torch.no_grad():
                 q_weight, scale, zero = self.weight_quantizer.quant2int(self.weight.detach())
                 self.weight_int = q_weight.to(torch.int32).detach()
@@ -452,6 +514,7 @@ class QuantConv2d(QuantConvBase):
         self.use_act_quant = act_quant
 
         if self.use_weight_quant:
+            self._guard_weight_scale_initialized()
             with torch.no_grad():
                 q_weight, scale, zero = self.weight_quantizer.quant2int(self.weight.detach())
                 self.weight_int = q_weight.to(torch.int32).detach()
@@ -644,6 +707,7 @@ class QuantConv3d(QuantConvBase):
         self.use_act_quant = act_quant
 
         if self.use_weight_quant:
+            self._guard_weight_scale_initialized()
             with torch.no_grad():
                 q_weight, scale, zero = self.weight_quantizer.quant2int(self.weight.detach())
                 self.weight_int = q_weight.to(torch.int32).detach()

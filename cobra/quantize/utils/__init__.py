@@ -6,7 +6,8 @@ import sys
 import numpy as np
 import torch
 from collections import OrderedDict
-from typing import Any, Dict, Iterator, List, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, Tuple, Optional, Set
 
 from ..int_linear import QuantLinear
 from ..int_conv import QuantConv1d, QuantConv2d, QuantConv3d
@@ -115,9 +116,22 @@ def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
 
 def set_static_quant(self, static_quant: bool = False):
     # setting weight quantization here does not affect actual forward pass
+    total = 0
+    changed = 0
+    desired_dynamic = not static_quant
     for m in self.modules():
         if isinstance(m, UniformAffineQuantizer):
-            m.is_dynamic_quant = not static_quant
+            total += 1
+            previous = getattr(m, "is_dynamic_quant", None)
+            if previous != desired_dynamic:
+                changed += 1
+            m.is_dynamic_quant = desired_dynamic
+    message = (
+        "[Quant] set_static_quant -> "
+        f"static={static_quant} total={total} updated={changed}"
+    )
+    logging.info(message)
+    print(message)
 
 def set_static_quant_weight(self, static_quant: bool = False):
     # setting weight quantization here does not affect actual forward pass
@@ -239,6 +253,22 @@ def _iter_quantizers_with_roles(model: torch.nn.Module) -> Iterator[Tuple[Any, s
             yield module, "other", label
 
 
+@dataclass(frozen=True)
+class QuantizerHandle:
+    quantizer: Any
+    kind: str
+    label: str
+
+    def is_initialized(self) -> bool:
+        return _is_quantizer_initialized(self.quantizer)
+
+
+def iter_quantizers(model: torch.nn.Module) -> Iterator[QuantizerHandle]:
+    """Yield lightweight wrappers for quantizers attached to ``model``."""
+    for quantizer, role, label in _iter_quantizers_with_roles(model):
+        yield QuantizerHandle(quantizer=quantizer, kind=role, label=label)
+
+
 def _is_quantizer_initialized(quantizer: torch.nn.Module) -> bool:
     """Return True when quantizer exposes scale and, if required, zero parameters."""
     scale = getattr(quantizer, "scale", None)
@@ -268,6 +298,54 @@ def _collect_uninitialized_quantizers(model: torch.nn.Module) -> Dict[str, List[
     return summary
 
 
+def count_observers(model: torch.nn.Module) -> Dict[str, int]:
+    """
+    Count observer modules attached to quantizers.
+
+    Returns a dict with ``total`` observers discovered, ``observing`` currently
+    receiving updates, and ``initialized`` quantizers whose observers have populated
+    scale/zero statistics.
+    """
+    total = 0
+    observing = 0
+    initialized = 0
+    seen: set[int] = set()
+
+    def _is_observing(candidate: Any) -> bool:
+        for attr in ("observe", "enabled", "is_enabled", "active"):
+            value = getattr(candidate, attr, None)
+            if isinstance(value, bool):
+                if value:
+                    return True
+            elif value is not None:
+                try:
+                    if bool(value):
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    for quantizer in _iter_all_quantizers(model):
+        observer = getattr(quantizer, "observer", None)
+        if observer is None:
+            continue
+        obs_id = id(observer)
+        if obs_id in seen:
+            continue
+        seen.add(obs_id)
+        total += 1
+        if _is_observing(observer) or _is_observing(quantizer):
+            observing += 1
+        if _is_quantizer_initialized(quantizer):
+            initialized += 1
+
+    return {
+        "total": total,
+        "observing": observing,
+        "initialized": initialized,
+    }
+
+
 def enable_observation(model: torch.nn.Module) -> None:
     """Turn on observation flags for modules and their quantizers."""
     for module in model.modules():
@@ -278,11 +356,40 @@ def enable_observation(model: torch.nn.Module) -> None:
                 for quantizer in _flatten_quantizer_objects(getattr(module, attr)):
                     if hasattr(quantizer, "observe"):
                         setattr(quantizer, "observe", True)
+    stats = count_observers(model)
+    message = (
+        "[Quant] enable_observation -> "
+        f"observers total={stats['total']} observing={stats['observing']} initialized={stats['initialized']}"
+    )
+    logging.info(message)
+    print(message)
 
 
-def finalize_all_quantizers(model: torch.nn.Module) -> None:
+def finalize_all_quantizers(model: torch.nn.Module, *, kind: str | None = None) -> None:
     """Finalize quantizers so they expose scale and zero parameters."""
+    allowed_ids: Optional[Set[int]] = None
+    if kind is not None:
+        normalized = kind.strip().lower()
+        if normalized in {"weight", "weights"}:
+            roles = {"weight"}
+        elif normalized in {"act", "activation", "activations"}:
+            roles = {"activation"}
+        elif normalized in {"all", ""}:
+            roles = None
+        else:
+            raise ValueError("`kind` must be one of {'weight', 'activation', 'all'} or None.")
+        if roles is not None:
+            allowed_ids = {
+                id(quantizer)
+                for quantizer, role, _ in _iter_quantizers_with_roles(model)
+                if role in roles
+            }
+            if not allowed_ids:
+                return
+
     for quantizer in _iter_all_quantizers(model):
+        if allowed_ids is not None and id(quantizer) not in allowed_ids:
+            continue
         ## observer 僅承載統計資訊，略過以避免誤觸缺少 dtype 的 finalize 路徑。
         if isinstance(quantizer, ObserverABC):
             continue
@@ -349,6 +456,28 @@ def assert_all_initialized(model: torch.nn.Module, msg: str | None = None) -> No
     raise RuntimeError(detail)
 
 
+def freeze_weight_qparams(model: torch.nn.Module) -> int:
+    """Disable dynamic initialisation for weight quantizers after calibration."""
+    frozen = 0
+    for quantizer, role, _ in _iter_quantizers_with_roles(model):
+        if role != "weight":
+            continue
+        observer = getattr(quantizer, "observer", None)
+        if observer is not None:
+            quantizer.observer = None
+        if hasattr(quantizer, "observered"):
+            quantizer.observered = True
+        if hasattr(quantizer, "is_dynamic_quant"):
+            quantizer.is_dynamic_quant = False
+        if hasattr(quantizer, "is_observing"):
+            quantizer.is_observing = False
+        if hasattr(quantizer, "observe"):
+            quantizer.observe = False
+        frozen += 1
+    logging.info("[Quant] freeze_weight_qparams -> frozen=%d", frozen)
+    return frozen
+
+
 def register_scales_and_zeros(module: torch.nn.Module) -> None:
     """
     Persist quantizer parameters as buffers for every UniformAffineQuantizer under ``module``.
@@ -356,45 +485,55 @@ def register_scales_and_zeros(module: torch.nn.Module) -> None:
     The helper should be invoked after calibration (and typically after enabling static quant)
     so that each quantizer has collected its scale and zero-point statistics.
     """
-    summary = _collect_uninitialized_quantizers(module)
-    if any(summary.values()):
-        for quantizer in _iter_all_quantizers(module):
-            if not isinstance(quantizer, UniformAffineQuantizer):
-                continue
-            try:
-                quantizer.export_params()
-            except RuntimeError:
-                finalized = False
-                if hasattr(quantizer, "finalize"):
-                    try:
-                        quantizer.finalize()
-                        finalized = True
-                    except Exception:
-                        finalized = False
-                if not finalized:
-                    dtype_candidate = _infer_dtype(quantizer)
-                    if dtype_candidate is not None:
-                        try:
-                            quantizer.calculate_qparams(dtype_candidate)
-                        except Exception:
-                            continue
-        summary = _collect_uninitialized_quantizers(module)
-    missing = sum(len(entries) for entries in summary.values())
-    if missing:
-        counts = ", ".join(
-            f"{role}={len(entries)}" for role, entries in summary.items() if entries
-        )
-        if counts:
-            logging.error("[Quant] Pending quantizers before export: %s", counts)
-        message = "Cannot export parameters before scale is initialised."
-        if counts:
-            message += f" Pending counts: {counts}."
-        message += " 請先跑校正 forward 或移除 --real-quant."
-        assert_all_initialized(module, msg=message)
+    quant_modules = [q for q in module.modules() if isinstance(q, UniformAffineQuantizer)]
+    qz_cnt = len(quant_modules)
+    if qz_cnt == 0:
+        raise RuntimeError("No quantizers found; did you run replacement?")
 
-    for quantizer in module.modules():
-        if isinstance(quantizer, UniformAffineQuantizer):
-            quantizer.register_scales_and_zeros()
+    summary = _collect_uninitialized_quantizers(module)
+    pending = sum(len(entries) for entries in summary.values())
+    if pending:
+        finalize_all_quantizers(module)
+        summary = _collect_uninitialized_quantizers(module)
+        pending = sum(len(entries) for entries in summary.values())
+        if pending:
+            counts = ", ".join(
+                f"{role}={len(entries)}" for role, entries in summary.items() if entries
+            )
+            if counts:
+                logging.error("[Quant] Pending quantizers before export: %s", counts)
+            message = "Cannot export parameters before scale is initialised."
+            if counts:
+                message += f" Pending counts: {counts}."
+            message += " 請先跑校正 forward 或移除 --real-quant."
+            raise RuntimeError(message)
+
+    registered_scales = 0
+    registered_zero_points = 0
+
+    def _zero_tensor(q: UniformAffineQuantizer) -> Optional[torch.Tensor]:
+        for name in ("zero_point", "round_zero_point", "zero"):
+            value = getattr(q, name, None)
+            if isinstance(value, torch.Tensor) and value.numel() > 0:
+                return value
+        return None
+
+    for quantizer in quant_modules:
+        quantizer.register_scales_and_zeros()
+        scale = getattr(quantizer, "scale", None)
+        if isinstance(scale, torch.Tensor) and scale.numel() > 0:
+            registered_scales += 1
+        zero_value = _zero_tensor(quantizer)
+        zero_required = not (
+            getattr(quantizer, "disable_zero_point", False) or getattr(quantizer, "symmetric", False)
+        )
+        if zero_value is not None or not zero_required:
+            registered_zero_points += 1
+
+    print(
+        "[QuantExport] register_scales_and_zeros -> "
+        f"scales={registered_scales}/{qz_cnt}, zero_points={registered_zero_points}/{qz_cnt}"
+    )
 
 
 def convert_to_int(
@@ -467,6 +606,8 @@ __all__ = [
     "set_observing",
     "enable_observation",
     "finalize_all_quantizers",
+    "freeze_weight_qparams",
+    "iter_quantizers",
     "summarize_quantizer_init",
     "count_uninitialized_quantizers",
     "assert_all_initialized",

@@ -1,0 +1,126 @@
+[Step 1] Calibration with targets: vision.dino,vision.siglip,mm.out
+[QuantConfig] W8A8
+11/03 [17:14:16] INFO     | >> [*] Downloading `cobra+3b from HF Hub  load.py:61
+11/03 [17:14:17] INFO     | >> [*] Found Config =>> Loading &         load.py:73
+                          Freezing cobra+3b with:                               
+                                       Vision Backbone =>>                      
+                          dinosiglip-vit-so-384px                               
+                                       LLM Backbone    =>>                      
+                          mamba-2.8b-zephyr                                     
+                                       Arch Specifier  =>>                      
+                          no-align+fused-gelu-mlp                               
+                                       Checkpoint Path =>>                      
+                          `/work/asdf1234/.cache/huggingface/hub/mode           
+                          ls--han1997--cobra/snapshots/7e3fb02b4f9291           
+                          f6dcc0e9143ada0e5d7239372d/cobra+3b/checkpo           
+                          ints/latest-checkpoint.pt`                            
+                 INFO     | >> [*] Loading Vision Backbone            load.py:82
+                          dinosiglip-vit-so-384px                               
+11/03 [17:14:20] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (timm/vit_large_patch14_reg4_dinov2.lv                
+                          d142m)                                                
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'pytorch_model.bin' (as                               
+                          'model.safetensors'). Loading weights                 
+                          using safetensors.                                    
+                 INFO     | >> Resized position embedding: (37,  pos_embed.py:55
+                          37) to (27, 27).                                      
+11/03 [17:14:24] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (('timm/ViT-SO400M-14-SigLIP-384',                    
+                          'open_clip_pytorch_model.bin'))                       
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'open_clip_pytorch_model.bin' (as                     
+                          'open_clip_model.safetensors'). Loading               
+                          weights using safetensors.                            
+11/03 [17:14:25] INFO     | >> [*] Loading Pretrained LLM             load.py:89
+                          mamba-2.8b-zephyr via HF Transformers                 
+                 INFO     | >>     |=> Building empty mamba LLM  base_llm.py:129
+                          from `xiuyul/mamba-2.8b-zephyr`                       
+11/03 [17:14:46] INFO     | >>     |=> Loading mamba (Fast)      base_llm.py:151
+                          Tokenizer via the AutoTokenizer API                   
+                 INFO     | >> [*] Loading VLM cobra+3b from          load.py:98
+                          Checkpoint; Freezing Weights 🥶                       
+Saved percentile statistics to `outputs/percentile_stats.pt` (vision.dino: 74649600, vision.siglip: 83980800, mm.out: 188416000).
+Average Latency: 158.47 ms/batch (repeat=10)
+
+=== Peak Memory & Runtime ===
+Mode: tensor
+Bits: W8A8
+Percentile: 99.99
+Rotation: hadamard=False, klt=False
+
+CPU Peak RSS: 4.43 GB
+GPU Peaks:
+  - device:0  alloc:7.39 GB  reserved:8.18 GB
+
+Elapsed: 50.69 s
+=============================
+[Step 2] Percentile low-bit validation run
+[Env] HF_HOME set to /work/asdf1234/.cache/huggingface
+[Env] DATASETS_DIR set to /work/asdf1234/samples
+CFG TYPE = <class 'cobra.quantize.config.QuantConfig'>
+HAS model_copy: False
+IS DATACLASS: True
+[QuantTargets] Resolved target prefixes: ['vision.dino', 'vision.siglip', 'mm.out']
+[System] torch=2.4.0+cu124 cuda=12.4
+[System] GPU=NVIDIA H100 80GB HBM3 free=78.58GB total=79.10GB
+11/03 [17:15:12] INFO     | >> [*] Downloading `cobra+3b from HF Hub  load.py:61
+11/03 [17:15:13] INFO     | >> [*] Found Config =>> Loading &         load.py:73
+                          Freezing cobra+3b with:                               
+                                       Vision Backbone =>>                      
+                          dinosiglip-vit-so-384px                               
+                                       LLM Backbone    =>>                      
+                          mamba-2.8b-zephyr                                     
+                                       Arch Specifier  =>>                      
+                          no-align+fused-gelu-mlp                               
+                                       Checkpoint Path =>>                      
+                          `/work/asdf1234/.cache/huggingface/hub/mode           
+                          ls--han1997--cobra/snapshots/7e3fb02b4f9291           
+                          f6dcc0e9143ada0e5d7239372d/cobra+3b/checkpo           
+                          ints/latest-checkpoint.pt`                            
+                 INFO     | >> [*] Loading Vision Backbone            load.py:82
+                          dinosiglip-vit-so-384px                               
+11/03 [17:15:16] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (timm/vit_large_patch14_reg4_dinov2.lv                
+                          d142m)                                                
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'pytorch_model.bin' (as                               
+                          'model.safetensors'). Loading weights                 
+                          using safetensors.                                    
+                 INFO     | >> Resized position embedding: (37,  pos_embed.py:55
+                          37) to (27, 27).                                      
+11/03 [17:15:20] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (('timm/ViT-SO400M-14-SigLIP-384',                    
+                          'open_clip_pytorch_model.bin'))                       
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'open_clip_pytorch_model.bin' (as                     
+                          'open_clip_model.safetensors'). Loading               
+                          weights using safetensors.                            
+11/03 [17:15:21] INFO     | >> [*] Loading Pretrained LLM             load.py:89
+                          mamba-2.8b-zephyr via HF Transformers                 
+                 INFO     | >>     |=> Building empty mamba LLM  base_llm.py:129
+                          from `xiuyul/mamba-2.8b-zephyr`                       
+11/03 [17:15:42] INFO     | >>     |=> Loading mamba (Fast)      base_llm.py:151
+                          Tokenizer via the AutoTokenizer API                   
+                 INFO     | >> [*] Loading VLM cobra+3b from          load.py:98
+                          Checkpoint; Freezing Weights 🥶                       
+[LinearQuant] Replacing nn.Linear -> QuantLinear (W8A8)
+[QuantPct][Linear] sample module paths: vision_backbone, llm_backbone, projector, tap_post_mm_out
+11/03 [17:15:49] INFO     | >> [QuantPct][Linear] Replaced 0    quant_pct.py:127
+                          module(s)                                             
+[LinearQuant] Replacement count: 0
+[ConvQuant] Replacing Conv layers (W8A8)
+[QuantPct][Conv] sample module paths: vision_backbone, llm_backbone, projector, tap_post_mm_out
+                 INFO     | >> [QuantPct][Conv] Replaced 0      quant_pct.py:127
+                          module(s)                                             
+[ConvQuant] Replacement count: 0
+[MatMulQuant] Replacing MatMul helpers (A8)
+[QuantPct][MatMul] sample module paths: vision_backbone, llm_backbone, projector, tap_post_mm_out
+                 INFO     | >> [QuantPct][MatMul] Replaced 0    quant_pct.py:127
+                          module(s)                                             
+[MatMulQuant] Replacement count: 0
+[QuantSummary] QuantLinear=0, QuantConv=0, QuantMatMul=0, total=0

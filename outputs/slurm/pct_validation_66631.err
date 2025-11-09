@@ -1,0 +1,55 @@
+-----------------
+loading CUDA 12.4
+-----------------
+
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/Cobra_clip/cobra/calibrate/enable_pct_lowbit.py:173: RuntimeWarning: [QuantPct][collect] Stats file only contains target:: entries. Apply may report missing observers. Consider removing --dump-where or using the default collect configuration.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/transformers/utils/generic.py:311: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+Traceback (most recent call last):
+  File "/work/asdf1234/Cobra_clip/cobra/calibrate/enable_pct_lowbit.py", line 2251, in main
+    _qp.calibrate_quantization(model, **calibrate_kwargs)
+  File "/work/asdf1234/Cobra_clip/cobra/switches/quant_pct.py", line 1323, in calibrate_quantization
+    _configure_model_observers(model, observer_cfg)
+  File "/work/asdf1234/Cobra_clip/cobra/switches/quant_pct.py", line 1782, in _configure_model_observers
+    _configure_linear_observers(module, observer_cfg)
+  File "/work/asdf1234/Cobra_clip/cobra/switches/quant_pct.py", line 1787, in _configure_linear_observers
+    _configure_quantizer(
+  File "/work/asdf1234/Cobra_clip/cobra/switches/quant_pct.py", line 1817, in _configure_quantizer
+    observer = build_observer(cfg["name"], **kwargs)
+  File "/work/asdf1234/Cobra_clip/cobra/quantize/observers/_register.py", line 136, in build_observer
+    return cls(**filter_args_of_cfg(cfg, cls))
+NameError: name 'filter_args_of_cfg' is not defined
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/work/asdf1234/miniconda3/envs/cobra/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/work/asdf1234/Cobra_clip/cobra/calibrate/enable_pct_lowbit.py", line 2380, in <module>
+    main()
+  File "/work/asdf1234/Cobra_clip/cobra/calibrate/enable_pct_lowbit.py", line 2256, in main
+    raise err
+  File "/work/asdf1234/Cobra_clip/cobra/calibrate/enable_pct_lowbit.py", line 2219, in main
+    _enable_apply(args.strict_missing_stats)
+  File "/work/asdf1234/Cobra_clip/cobra/calibrate/enable_pct_lowbit.py", line 2208, in _enable_apply
+    quant_pct.enable(
+  File "/work/asdf1234/Cobra_clip/cobra/switches/quant_pct.py", line 448, in enable
+    raise KeyError(
+KeyError: "Percentile stats missing required observers for ['vision_backbone.dino', 'vision_backbone.siglip', 'projector.out'] (source=/work/asdf1234/Cobra_clip/outputs/percentile_stats.pt). Diagnostics: vision_backbone.dino (candidates=<none>; available=<none>); vision_backbone.siglip (candidates=<none>; available=<none>); projector.out (candidates=<none>; available=<none>)"

@@ -1,0 +1,68 @@
+[Step 1] Calibration with targets: vision.dino,vision.siglip,mm.out
+[QuantConfig] W8A8
+11/02 [22:54:03] INFO     | >> [*] Downloading `cobra+3b from HF Hub  load.py:61
+                 INFO     | >> [*] Found Config =>> Loading &         load.py:73
+                          Freezing cobra+3b with:                               
+                                       Vision Backbone =>>                      
+                          dinosiglip-vit-so-384px                               
+                                       LLM Backbone    =>>                      
+                          mamba-2.8b-zephyr                                     
+                                       Arch Specifier  =>>                      
+                          no-align+fused-gelu-mlp                               
+                                       Checkpoint Path =>>                      
+                          `/home/asdf1234/.cache/huggingface/hub/mode           
+                          ls--han1997--cobra/snapshots/7e3fb02b4f9291           
+                          f6dcc0e9143ada0e5d7239372d/cobra+3b/checkpo           
+                          ints/latest-checkpoint.pt`                            
+                 INFO     | >> [*] Loading Vision Backbone            load.py:82
+                          dinosiglip-vit-so-384px                               
+11/02 [22:54:06] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (timm/vit_large_patch14_reg4_dinov2.lv                
+                          d142m)                                                
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'pytorch_model.bin' (as                               
+                          'model.safetensors'). Loading weights                 
+                          using safetensors.                                    
+                 INFO     | >> Resized position embedding: (37,  pos_embed.py:55
+                          37) to (27, 27).                                      
+11/02 [22:54:10] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (('timm/ViT-SO400M-14-SigLIP-384',                    
+                          'open_clip_pytorch_model.bin'))                       
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'open_clip_pytorch_model.bin' (as                     
+                          'open_clip_model.safetensors'). Loading               
+                          weights using safetensors.                            
+11/02 [22:54:11] INFO     | >> [*] Loading Pretrained LLM             load.py:89
+                          mamba-2.8b-zephyr via HF Transformers                 
+                 INFO     | >>     |=> Building empty mamba LLM  base_llm.py:129
+                          from `xiuyul/mamba-2.8b-zephyr`                       
+11/02 [22:54:32] INFO     | >>     |=> Loading mamba (Fast)      base_llm.py:151
+                          Tokenizer via the AutoTokenizer API                   
+                 INFO     | >> [*] Loading VLM cobra+3b from          load.py:98
+                          Checkpoint; Freezing Weights 🥶                       
+Saved percentile statistics to `outputs/percentile_stats.pt` (vision.dino: 74649600, vision.siglip: 83980800, mm.out: 188416000).
+Average Latency: 159.08 ms/batch (repeat=10)
+
+=== Peak Memory & Runtime ===
+Mode: tensor
+Bits: W8A8
+Percentile: 99.99
+Rotation: hadamard=False, klt=False
+
+CPU Peak RSS: 4.35 GB
+GPU Peaks:
+  - device:0  alloc:7.39 GB  reserved:8.18 GB
+
+Elapsed: 48.64 s
+=============================
+[Step 2] Unit tests
+============================= test session starts ==============================
+platform linux -- Python 3.10.19, pytest-8.4.2, pluggy-1.6.0
+rootdir: /work/asdf1234/Cobra_clip
+configfile: pyproject.toml
+plugins: anyio-4.11.0
+collected 0 items
+
+============================ no tests ran in 0.00s =============================

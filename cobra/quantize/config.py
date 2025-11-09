@@ -15,47 +15,7 @@ except ImportError as exc:
 
 @dataclass
 class QuantConfig:
-    """Configuration for percentile-based activation clipping.
-
-    Attributes
-    ----------
-    p_max:
-        Upper percentile (0-100) used to determine the clipping threshold.
-    mode:
-        Aggregation strategy used by the observers. Currently, "tensor" is supported
-        which computes a single percentile across the entire tensor. Additional modes can
-        be added in the future (e.g. per-channel) by extending the observers.
-    stats_path:
-        Location where calibration statistics are stored. Relative paths are resolved
-        with respect to the current working directory when the configuration is loaded.
-    max_samples:
-        Maximum number of samples retained by observers while estimating the percentile.
-        Larger values improve stability at the cost of memory usage.
-    batch_size:
-        Batch size used during calibration runs.
-    num_batches:
-        Optional limit on the number of batches processed during calibration. None
-        means that the entire dataloader is consumed.
-    prompt:
-        Default textual prompt used when running calibration without task specific data.
-    num_workers:
-        Number of dataloader workers.
-    device / dtype:
-        Optional device override (e.g. "cuda" or "cpu"). If None the script
-        will select cuda when available. ``dtype`` controls the calibration
-        tensor dtype and accepts either a torch.dtype instance or a string name.
-    weight_bits / act_bits:
-        Bit-width used for weight and activation quantisation respectively.
-    act_quant:
-        Whether activation quantization should be enabled on auxiliary wrappers
-        such as QuantSoftmax/QuantAdd.
-    add_quant / swiglu_quant / swilu_quant:
-        Feature toggles controlling whether the corresponding helper wrappers
-        should be instantiated when `replace_other_layers` is executed.
-    act_quant_params / x1_quant_params / x2_quant_params:
-        Optional dictionaries with quantizer configuration forwarded to the
-        respective quantized helper modules.
-    """
+    """Configuration for percentile-based activation clipping."""
 
     p_max: float = 99.9
     mode: str = "tensor"
@@ -137,6 +97,9 @@ class QuantConfig:
             data.setdefault("act_bits", bits.get("activation", data.get("act_bits", 8)))
         data.setdefault("weight_bits", 8)
         data.setdefault("act_bits", 8)
+        # Legacy percentile override fields are ignored now that the feature is removed.
+        data.pop("percentile", None)
+        data.pop("clipping", None)
         return cls(**data)
 
     def to_dict(self) -> Dict[str, Any]:
