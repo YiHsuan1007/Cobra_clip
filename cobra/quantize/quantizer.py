@@ -1,4 +1,3 @@
-import logging
 from re import U
 import torch
 import torch.nn as nn
@@ -145,14 +144,23 @@ class UniformAffineQuantizer(nn.Module):
             self.observer = PercentileObserver(percent=self.percent,granularity=granularity)
         else:
             self.observer = MinMaxObserver(granularity=granularity)
-        self.observer.owner = self
- 
-        self.observered = False
+            self.observer.owner = self
         
-        self.is_weight = is_weight
-        self._reference_shape = torch.Size(shape) if shape is not None else None
-        self._scale_storage_shape: Optional[torch.Size] = None
-        self._zero_storage_shape: Optional[torch.Size] = None
+            self.observered = False
+            
+            self.is_weight = is_weight
+            self._reference_shape = torch.Size(shape) if shape is not None else None
+            self._scale_storage_shape: Optional[torch.Size] = None
+            self._zero_storage_shape: Optional[torch.Size] = None
+            self._pending_percentile = False
+
+    @property
+    def pending(self) -> bool:
+        return bool(getattr(self, "_pending_percentile", False))
+
+    @pending.setter
+    def pending(self, value: bool) -> None:
+        self._pending_percentile = bool(value)
 
     def change_n_bits(self, n_bits):
         self.n_bits = n_bits
@@ -289,70 +297,83 @@ class UniformAffineQuantizer(nn.Module):
 
         return scale.to(x.device), None if zero_point is None else zero_point.to(x.device)
 
-    def export_percentile_stats(self) -> Dict[str, Any]:
-        """Return percentile statistics suitable for persistence."""
+    def export_percentile_stats(self) -> Optional[Dict[str, Any]]:
+        """Return percentile statistics suitable for per-quantizer export."""
         if str(getattr(self, "mode", "")).lower() != "percentile":
-            return {"pending": True}
+            return None
+        if getattr(self, "_pending_percentile", False):
+            return None
 
-        def _tensor_to_python(tensor: torch.Tensor) -> Any:
+        scale_tensor = getattr(self, "scale", None)
+        if not isinstance(scale_tensor, torch.Tensor) or scale_tensor.numel() == 0:
+            return None
+        scale_tensor = scale_tensor.detach().float().cpu()
+
+        zero_tensor = getattr(self, "round_zero_point", None)
+        if isinstance(zero_tensor, torch.Tensor) and zero_tensor.numel() > 0:
+            zero_tensor = zero_tensor.detach().float().cpu()
+        else:
+            zero_tensor = None
+
+        def _tensor_to_python(tensor: Optional[torch.Tensor]) -> Any:
+            if tensor is None:
+                return None
             tensor = tensor.detach().cpu()
             if tensor.numel() == 1:
                 return float(tensor.item())
             return tensor.reshape(-1).tolist()
 
-        observer = getattr(self, "observer", None)
-        min_tensor: Optional[torch.Tensor] = None
-        max_tensor: Optional[torch.Tensor] = None
+        def _tensor_to_int_payload(tensor: Optional[torch.Tensor]) -> Any:
+            value = _tensor_to_python(tensor)
+            if value is None:
+                return None
+            if isinstance(value, list):
+                return [int(round(v)) for v in value]
+            return int(round(value))
 
-        if observer is not None and hasattr(observer, "cal_min_max"):
-            try:
-                obs_min, obs_max = observer.cal_min_max()
-            except Exception:
-                obs_min = getattr(observer, "min_val", None)
-                obs_max = getattr(observer, "max_val", None)
-            if isinstance(obs_min, torch.Tensor) and obs_min.numel() > 0:
-                min_tensor = obs_min.detach().float().cpu()
-            if isinstance(obs_max, torch.Tensor) and obs_max.numel() > 0:
-                max_tensor = obs_max.detach().float().cpu()
+        def _observer_meta() -> Optional[Dict[str, Any]]:
+            observer = getattr(self, "observer", None)
+            if observer is None:
+                return None
+            meta: Dict[str, Any] = {
+                "type": observer.__class__.__name__,
+                "granularity": getattr(observer, "granularity", None),
+            }
+            for attr in ("left_percent", "right_percent", "percentile_mode"):
+                if hasattr(observer, attr):
+                    raw_value = getattr(observer, attr)
+                    if isinstance(raw_value, torch.Tensor):
+                        if raw_value.numel() == 1:
+                            raw_value = float(raw_value.item())
+                        else:
+                            raw_value = raw_value.detach().cpu().reshape(-1).tolist()
+                    meta[attr] = raw_value
+            return meta
 
-        if min_tensor is None or max_tensor is None:
-            scale_tensor = getattr(self, "scale", None)
-            zero_tensor = getattr(self, "round_zero_point", None)
-            if not isinstance(scale_tensor, torch.Tensor) or scale_tensor.numel() == 0:
-                return {"pending": True}
-            scale_tensor = scale_tensor.detach().float().cpu()
-            if isinstance(zero_tensor, torch.Tensor) and zero_tensor.numel() > 0:
-                zero_tensor = zero_tensor.detach().float().cpu()
-            else:
-                zero_tensor = None
-            if self.symmetric or self.disable_zero_point or zero_tensor is None:
-                clip_tensor = scale_tensor * (2 ** (self.n_bits - 1) - 1)
-                max_tensor = clip_tensor
-                min_tensor = -clip_tensor
-            else:
-                zero_tensor = zero_tensor if zero_tensor is not None else torch.zeros_like(scale_tensor)
-                qmax = float(self.qmax)
-                qmin = float(self.qmin)
-                max_tensor = (qmax - zero_tensor) * scale_tensor
-                min_tensor = (qmin - zero_tensor) * scale_tensor
-        payload: Dict[str, Any] = {"mode": "percentile", "bitwidth": int(self.n_bits)}
-        percent_value = float(getattr(self, "percent", 0.0))
-        percent_key: Optional[str] = None
-        if percent_value > 0.0:
-            payload["percent"] = percent_value
-            percent_key = f"p{percent_value * 100:.6g}".replace(".", "_")
-
-        payload["min"] = _tensor_to_python(min_tensor)
-        payload["max"] = _tensor_to_python(max_tensor)
-        clip_tensor = torch.max(max_tensor.abs(), min_tensor.abs())
-        clip_value = _tensor_to_python(clip_tensor)
-        if percent_key is not None:
-            payload[percent_key] = clip_value
+        bits = int(getattr(self, "n_bits", getattr(self, "bits", 0)) or 0)
+        if bits <= 0:
+            return None
+        qmax = float(getattr(self, "qmax", 0))
+        qmin = float(getattr(self, "qmin", 0))
+        if self.symmetric or self.disable_zero_point or zero_tensor is None:
+            clip_tensor = scale_tensor * (2 ** (bits - 1) - 1)
+            clip_max = clip_tensor
+            clip_min = -clip_tensor
         else:
-            payload["clip"] = clip_value
-        # Fill canonical bucket keys so downstream tools can pick the strongest threshold.
-        for key in ("p99", "p99_9", "p99_99", "p99_999"):
-            payload.setdefault(key, clip_value)
+            clip_max = (qmax - zero_tensor) * scale_tensor
+            clip_min = (qmin - zero_tensor) * scale_tensor
+
+        percentile = float(getattr(self, "percent", getattr(self, "percentile", 0.0)))
+        payload: Dict[str, Any] = {
+            "mode": "percentile",
+            "percentile": percentile,
+            "clip_min": _tensor_to_python(clip_min),
+            "clip_max": _tensor_to_python(clip_max),
+            "scale": _tensor_to_python(scale_tensor),
+            "zero_point": _tensor_to_int_payload(zero_tensor) if zero_tensor is not None else 0,
+            "bits": bits,
+            "observer_meta": _observer_meta(),
+        }
         return payload
 
     def apply_percentile_stats(self, stats: Mapping[str, Any]) -> None:
@@ -371,13 +392,35 @@ class UniformAffineQuantizer(nn.Module):
             return tensor
 
         clip_value = stats.get("clip")
+        clip_min_value = stats.get("clip_min")
+        clip_max_value = stats.get("clip_max")
         min_value = stats.get("min")
         max_value = stats.get("max")
+
+        if clip_min_value is not None and clip_max_value is not None:
+            min_value = clip_min_value
+            max_value = clip_max_value
 
         for key in ("p99_999", "p99_99", "p99_9", "p99"):
             if key in stats:
                 clip_value = stats[key]
                 break
+
+        if (min_value is None or max_value is None) and stats.get("scale") is not None:
+            scale_tensor = _to_tensor(stats["scale"])
+            zero_value = stats.get("zero_point")
+            zero_tensor = _to_tensor(zero_value) if zero_value is not None else None
+            bits_value = int(stats.get("bits", getattr(self, "n_bits", 0)))
+            if bits_value > 0:
+                if self.symmetric or self.disable_zero_point or zero_tensor is None:
+                    clip_tensor = scale_tensor * (2 ** (bits_value - 1) - 1)
+                    min_value = -clip_tensor
+                    max_value = clip_tensor
+                else:
+                    qmax = float(getattr(self, "qmax", 0))
+                    qmin = float(getattr(self, "qmin", 0))
+                    max_value = (qmax - zero_tensor) * scale_tensor
+                    min_value = (qmin - zero_tensor) * scale_tensor
 
         clip_tensor = _to_tensor(clip_value) if clip_value is not None else None
         min_tensor = _to_tensor(min_value) if min_value is not None else None
@@ -406,6 +449,7 @@ class UniformAffineQuantizer(nn.Module):
             self.observered = True
         self.is_observing = False
         self._update_storage_shapes()
+        self._pending_percentile = False
 
     ## dtype 需正規化成帶 qmin/qmax/bitwidth 的物件，方便 observer 使用硬體語義做縮放。
     def _normalize_observer_dtype(self, candidate: Any, signed_fallback: bool) -> Any:

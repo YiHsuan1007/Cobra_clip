@@ -2493,6 +2493,7 @@ def main() -> None:
                         mode="collect",
                         targets=enable_targets,
                         strict_missing_stats=False,
+                        wrap_fake_quant=True,
                     )
                     try:
                         try:
@@ -2516,9 +2517,9 @@ def main() -> None:
                         _qp.calibrate_quantization(model, **calibrate_kwargs)
                     finally:
                         quant_pct.disable(model)
-                    _enable_apply(True)
                 except Exception:
                     raise err
+                _enable_apply(True)
         else:
             if args.mode == "collect" and args.dump_activations:
                 print(

@@ -25,28 +25,11 @@ from cobra.integration.hooks import DEFAULT_PERCENTILE_TARGET_MAP
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
-_FINAL_TARGET_PREFIX = {
-    "vision_backbone.dino": "vision_backbone.dino_featurizer",
-    "vision_backbone.siglip": "vision_backbone.siglip_featurizer",
-    "projector.out": "projector.out",
-}
-
-_MODULE_PREFIX_REMAP: Dict[str, str] = {}
-for hook_name, module_path in DEFAULT_PERCENTILE_TARGET_MAP.items():
-    canonical = normalize_target_name(hook_name)
-    final_prefix = _FINAL_TARGET_PREFIX.get(canonical)
-    if final_prefix is not None:
-        _MODULE_PREFIX_REMAP[module_path] = final_prefix
-
-
-def _rewrite_module_path(path: str) -> str:
-    for source, target in _MODULE_PREFIX_REMAP.items():
-        if path == source:
-            return target
-        if path.startswith(f"{source}."):
-            suffix = path[len(source) :]
-            return f"{target}{suffix}"
-    return path
+if hasattr(quant_pct, "rewrite_percentile_module_path"):
+    _rewrite_module_path = quant_pct.rewrite_percentile_module_path
+else:
+    def _rewrite_module_path(path: str) -> str:
+        return path
 
 
 def _resolve_calibration_targets(raw_targets: Optional[Sequence[str]]) -> Optional[Tuple[str, ...]]:
@@ -153,35 +136,75 @@ def _format_quantizer_key(module_name: str, role: str, index: int, total: int) -
     return f"{module_name}.{role_token}_quantizer.{index}"
 
 
-def _collect_percentile_quantizer_stats(model: nn.Module) -> Tuple[OrderedDict[str, Dict[str, Any]], int]:
+def _safe_named_modules(model: nn.Module):
+    """Yield (name, module) even if ``named_modules`` returns extra metadata."""
+    for entry in model.named_modules():
+        if isinstance(entry, tuple) or isinstance(entry, list):
+            if len(entry) >= 2:
+                yield entry[0], entry[1]
+                continue
+        try:
+            name, module = entry  # type: ignore[misc]
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            raise ValueError(f"Unsupported named_modules() entry: {entry!r}") from exc
+        yield name, module
+
+
+def _collect_percentile_quantizer_stats(
+    model: nn.Module,
+    *,
+    strict_missing_observer: bool = False,
+) -> Tuple[OrderedDict[str, Dict[str, Any]], int]:
     stats: OrderedDict[str, Dict[str, Any]] = OrderedDict()
     total_entries = 0
-    for name, module in model.named_modules():
+    for name, module in _safe_named_modules(model):
         if not name:
             continue
+        if not any(getattr(module, attr, None) is not None for attr in ("weight_quantizer", "act_quantizer")):
+            continue
         rewritten = _rewrite_module_path(name)
-        for role, attr in (("weight", "weight_quantizer"), ("activation", "act_quantizer")):
-            quantizers = [
-                quant
-                for quant in _iter_uniform_quantizers(getattr(module, attr, None))
-                if str(getattr(quant, "mode", "")).lower() == "percentile"
-            ]
+        for role, attr in (("weight", "weight_quantizer"), ("act", "act_quantizer")):
+            quantizers = _iter_uniform_quantizers(getattr(module, attr, None))
             if not quantizers:
                 continue
             total = len(quantizers)
             for idx, quant in enumerate(quantizers):
+                if str(getattr(quant, "mode", "")).lower() != "percentile":
+                    continue
+                key = _format_quantizer_key(rewritten, role, idx, total)
+                pending = bool(getattr(quant, "_pending_percentile", False))
+                if pending:
+                    message = f"[PercentileStats][warn] Pending observer for {key}; skipping entry."
+                    if strict_missing_observer:
+                        raise RuntimeError(message.replace("[PercentileStats][warn] ", ""))
+                    print(message)
+                    continue
                 exporter = getattr(quant, "export_percentile_stats", None)
                 if not callable(exporter):
                     continue
                 payload = exporter()
-                if not isinstance(payload, Mapping):
+                if not payload:
+                    message = f"[PercentileStats][warn] Missing export payload for {key}; skipping entry."
+                    if strict_missing_observer:
+                        raise RuntimeError(message.replace("[PercentileStats][warn] ", ""))
+                    print(message)
                     continue
-                if payload.get("pending"):
-                    continue
-                key = _format_quantizer_key(rewritten, role, idx, total)
                 stats[key] = dict(payload)
                 total_entries += 1
     return stats, total_entries
+
+def _count_quantizers(model: nn.Module) -> Tuple[int, int, int]:
+    weight_count = 0
+    act_count = 0
+    total = 0
+    for _, module in _safe_named_modules(model):
+        if getattr(module, "weight_quantizer", None) is not None:
+            weight_count += 1
+            total += 1
+        if getattr(module, "act_quantizer", None) is not None:
+            act_count += 1
+            total += 1
+    return weight_count, act_count, total
 
 
 def _build_target_stats(stats: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -240,6 +263,30 @@ def parse_args() -> argparse.Namespace:
         "--stats-out",
         default=None,
         help="Optional path to export percentile statistics for downstream application.",
+    )
+    parser.add_argument(
+        "--wrap-fake-quant",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Wrap model with percentile-ready fake quant layers before calibration (default: enabled).",
+    )
+    parser.add_argument(
+        "--force-percentile",
+        type=float,
+        choices=(99.9, 99.99, 99.999),
+        default=None,
+        help="Override cfg.p_max with a fixed percentile (supports 99.9, 99.99, 99.999).",
+    )
+    parser.add_argument(
+        "--export-quantizer-sample",
+        type=int,
+        default=0,
+        help="Print the first N per-quantizer export entries (key + clip_max) before saving stats.",
+    )
+    parser.add_argument(
+        "--strict-missing-observer",
+        action="store_true",
+        help="Raise an error if any percentile quantizer lacks observer data during export.",
     )
     return parser.parse_args()
 
@@ -336,6 +383,9 @@ def main() -> None:
         cfg.weight_bits = int(args.weight_bits)
     if args.act_bits is not None:
         cfg.act_bits = int(args.act_bits)
+    if args.force_percentile is not None:
+        cfg.p_max = float(args.force_percentile)
+        print(f"[QuantConfig] forcing percentile to {cfg.p_max}")
     print(f"[QuantConfig] W{cfg.weight_bits}A{cfg.act_bits}")
 
     user_targets = _parse_targets(args.targets)
@@ -353,6 +403,17 @@ def main() -> None:
 
     model = load_model(args.ckpt, hf_token=args.hf_token)
     model.to(device, dtype=dtype)
+    if args.wrap_fake_quant:
+        quant_pct.wrap_model_for_percentile(model, cfg.weight_bits, cfg.act_bits, cfg.p_max)
+    else:
+        print("[Calib] wrap_fake_quant disabled; assuming model already wrapped.")
+    weight_q_before, act_q_before, total_q_before = _count_quantizers(model)
+    if total_q_before == 0:
+        warning = "[Warning] No quantizers found. Per-quantizer export will be empty."
+        print(warning)
+    print(
+        f"[Debug][Quantizer] before-calib: weight={weight_q_before} act={act_q_before} total={total_q_before}"
+    )
 
     transform = model.vision_backbone.image_transform
     limit = None
@@ -367,24 +428,60 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
         collate_fn=_collate,
     )
+    try:
+        num_batches = len(dataloader)
+    except TypeError:
+        num_batches = None
+    if num_batches is None:
+        print("[Calib] num_batches=unknown (non-sized dataloader)")
+    else:
+        print(f"[Calib] num_batches={num_batches}")
+        if num_batches == 0:
+            raise RuntimeError("[fatal] No calibration batches. Increase --num-batches or provide data.")
 
-    stats = quant_pct.calibrate(model, dataloader, cfg, targets=calibration_targets)
+    fw_counter = {"value": 0}
+
+    def _count_forward(_module, _inputs):
+        fw_counter["value"] += 1
+
+    forward_hook = model.register_forward_pre_hook(_count_forward)
+    try:
+        stats = quant_pct.calibrate(model, dataloader, cfg, targets=calibration_targets)
+    finally:
+        forward_hook.remove()
+    if fw_counter["value"] == 0:
+        print("[warn] forward not executed. quantizers likely remain pending.")
+    weight_q_after, act_q_after, total_q_after = _count_quantizers(model)
+    print(
+        f"[Debug][Quantizer] before-export: weight={weight_q_after} act={act_q_after} total={total_q_after}"
+    )
 
     if args.stats_out:
         export_payload = OrderedDict()
         export_payload["config"] = cfg.to_dict()
         export_payload["targets"] = normalize_targets(stats.get("targets") or [])
         export_payload["observers"] = stats.get("observers", {})
-        quant_payload, quant_count = _collect_percentile_quantizer_stats(model)
+        quant_payload, quant_count = _collect_percentile_quantizer_stats(
+            model, strict_missing_observer=args.strict_missing_observer
+        )
+        sample_limit = max(0, int(args.export_quantizer_sample or 0))
+        if sample_limit and quant_payload:
+            print(f"[QuantizerSample] previewing first {min(sample_limit, len(quant_payload))} entries:")
+            for idx, (key, payload) in enumerate(quant_payload.items()):
+                if idx >= sample_limit:
+                    break
+                clip_max = payload.get("clip_max")
+                if clip_max is None:
+                    clip_max = payload.get("clip")
+                print(f"  - {key}: clip_max={clip_max}")
         export_payload.update(quant_payload)
         output_path = Path(args.stats_out).expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(export_payload, output_path)
-        file_size = output_path.stat().st_size
-        print(
-            f"[PercentileStats] Exported {quant_count} quantizer entries to `{args.stats_out}` "
-            f"(size={file_size / 1024:.1f} KiB)."
-        )
+        if quant_count > 0:
+            print(f"[PercentileStats] Exported {quant_count} quantizer entries to `{args.stats_out}`.")
+        else:
+            print(f"[PercentileStats][warn] No percentile quantizer entries exported to `{args.stats_out}`.")
 
     observed_targets = stats.get("targets") or []
     sample_summary = ", ".join(

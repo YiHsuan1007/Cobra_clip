@@ -20,6 +20,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from cobra.integration.hooks import (
+    DEFAULT_PERCENTILE_TARGET_MAP,
     DEFAULT_PERCENTILE_TARGETS,
     attach_percentile_hooks,
     remove_handles,
@@ -72,6 +73,8 @@ __all__ = [
     "convert_to_int",
     "activate_observers",
     "finalize_quant_params",
+    "wrap_model_for_percentile",
+    "rewrite_percentile_module_path",
 ]
 
 _HANDLE_ATTR = "_quant_pct_handles"
@@ -88,7 +91,57 @@ LEGACY_TARGET_MAP: Dict[str, str] = {
     # Newly exported keys that still need expansion
     "vision_backbone.dino": "vision_backbone.dino_featurizer",
     "vision_backbone.siglip": "vision_backbone.siglip_featurizer",
+    "projector.out": "projector.out",
 }
+
+_FINAL_TARGET_PREFIX: Dict[str, str] = {
+    "vision_backbone.dino": "vision_backbone.dino_featurizer",
+    "vision_backbone.siglip": "vision_backbone.siglip_featurizer",
+    "projector.out": "projector.out",
+}
+
+
+def _build_module_prefix_remap() -> Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...]:
+    remap: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = []
+    for hook_name, module_path in DEFAULT_PERCENTILE_TARGET_MAP.items():
+        canonical = normalize_target_name(hook_name)
+        final_prefix = _FINAL_TARGET_PREFIX.get(canonical)
+        if final_prefix is None:
+            continue
+        source_segments = tuple(part for part in module_path.split(".") if part)
+        target_segments = tuple(part for part in final_prefix.split(".") if part)
+        if not source_segments or not target_segments:
+            continue
+        remap.append((source_segments, target_segments))
+    return tuple(remap)
+
+
+_MODULE_PREFIX_REMAP = _build_module_prefix_remap()
+
+
+def rewrite_percentile_module_path(path: str) -> str:
+    """
+    Normalize module paths so percentile stats export/import share consistent prefixes.
+
+    When the model nests target modules under an extra namespace (e.g. ``model.vision_backbone``),
+    this helper rewrites the matching sub-paths to the canonical prefixes used during export.
+    """
+
+    if not path:
+        return path
+    segments = [part for part in path.split(".") if part]
+    if not segments:
+        return path
+
+    for source_segments, target_segments in _MODULE_PREFIX_REMAP:
+        length = len(source_segments)
+        if length == 0 or length > len(segments):
+            continue
+        for offset in range(len(segments) - length + 1):
+            if segments[offset : offset + length] == list(source_segments):
+                rewritten = segments[:offset] + list(target_segments) + segments[offset + length :]
+                return ".".join(rewritten)
+    return path
 logger = logging.getLogger(__name__)
 
 _Batch = Any
@@ -159,6 +212,19 @@ def _iter_percentile_quantizers(module: nn.Module, attr: str) -> List[UniformAff
     ]
 
 
+def _safe_named_modules(model: nn.Module) -> Iterable[Tuple[str, nn.Module]]:
+    """Yield (name, module) even if named_modules returns extra metadata."""
+    for entry in model.named_modules():
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            yield entry[0], entry[1]
+            continue
+        try:
+            name, module = entry  # type: ignore[misc]
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            raise ValueError(f"Unsupported named_modules() entry: {entry!r}") from exc
+        yield name, module
+
+
 def _load_and_apply_percentile_stats(model: nn.Module, path: str, logger: logging.Logger) -> Tuple[int, int]:
     resolved = Path(path).expanduser()
     if not resolved.exists():
@@ -183,17 +249,23 @@ def _load_and_apply_percentile_stats(model: nn.Module, path: str, logger: loggin
 
     applied = 0
     missing = 0
-    for module_name, module in model.named_modules():
+    for module_name, module in _safe_named_modules(model):
         if not module_name:
             continue
+        canonical_module = rewrite_percentile_module_path(module_name)
         for role, attr in (("weight", "weight_quantizer"), ("act", "act_quantizer")):
             quantizers = _iter_percentile_quantizers(module, attr)
             total = len(quantizers)
             if total == 0:
                 continue
             for idx, quantizer in enumerate(quantizers):
-                key = _format_quantizer_key(module_name, role, idx, total)
+                key = _format_quantizer_key(canonical_module, role, idx, total)
                 stats_entry = payload.get(key)
+                if stats_entry is None and canonical_module != module_name:
+                    legacy_key = _format_quantizer_key(module_name, role, idx, total)
+                    stats_entry = payload.get(legacy_key)
+                    if stats_entry is not None:
+                        key = legacy_key
                 if isinstance(stats_entry, Mapping):
                     try:
                         quantizer.apply_percentile_stats(stats_entry)
@@ -332,7 +404,9 @@ def calibrate_percentiles(
     targets: Optional[Iterable[str]] = None,
 ) -> dict:
     """Run calibration and persist observer statistics."""
-    return calibrate_model(model, dataloader, cfg, targets=targets)
+    stats = calibrate_model(model, dataloader, cfg, targets=targets)
+    _finalize_pending_percentiles(model, logger)
+    return stats
 
 
 def activate_observers(model: nn.Module) -> None:
@@ -415,6 +489,86 @@ def _collect_observers(
         result[canonical_name] = _build_observer(state, cfg, target=canonical_name)
     return result, missing
 
+def wrap_model_for_percentile(
+    model: nn.Module,
+    weight_bits: int,
+    act_bits: int,
+    percent: float,
+) -> nn.Module:
+    """Ensure supported modules are wrapped with percentile-ready quantizers."""
+    if getattr(model, "_quant_pct_fake_wrapped", False):
+        return model
+
+    if percent > 1.0:
+        percent = percent / 100.0
+
+    cfg_stub = types.SimpleNamespace(
+        weight_bits=weight_bits,
+        act_bits=act_bits,
+        targets=None,
+        observe="percentile",
+        conv_observer="percentile",
+        matmul_observer="percentile",
+        conv_weight_quant_params=None,
+        conv_act_quant_params=None,
+        matmul_x1_quant_params=None,
+        matmul_x2_quant_params=None,
+        disable_input_quant=False,
+        conv_weight_bits=weight_bits,
+        conv_act_bits=act_bits,
+        matmul_act_bits=act_bits,
+        strict_target_budget=False,
+    )
+
+    replace_linear_layers(model, cfg_stub, weight_bits=weight_bits, act_bits=act_bits)
+    replace_conv_layers(model, cfg_stub, weight_bits=weight_bits, act_bits=act_bits)
+    replace_matmul_layers(model, cfg_stub, act_bits=act_bits)
+
+    for module in model.modules():
+        for attr in ("weight_quantizer", "act_quantizer"):
+            quantizers = _flatten_quantizer_objects(getattr(module, attr, None))
+        for quantizer in quantizers:
+            if not isinstance(quantizer, UniformAffineQuantizer):
+                continue
+            quantizer.mode = "percentile"
+            quantizer.percent = percent
+            quantizer.observered = False
+            quantizer.cached_xmin = None
+            quantizer.cached_xmax = None
+            if hasattr(quantizer, "observer") and quantizer.observer is not None:
+                quantizer.observer.owner = quantizer
+            if hasattr(quantizer, "scale"):
+                quantizer.scale = None
+            if hasattr(quantizer, "round_zero_point"):
+                quantizer.round_zero_point = None
+            quantizer._pending_percentile = True
+    setattr(model, "_quant_pct_fake_wrapped", True)
+    return model
+
+
+def _finalize_pending_percentiles(
+    model: nn.Module,
+    logger: logging.Logger,
+) -> None:
+    for module_name, module in _safe_named_modules(model):
+        for role, attr in (("weight", "weight_quantizer"), ("act", "act_quantizer")):
+            quantizers = _iter_percentile_quantizers(module, attr)
+            total = len(quantizers)
+            if total == 0:
+                continue
+            for idx, quantizer in enumerate(quantizers):
+                pending = getattr(quantizer, "_pending_percentile", False)
+                if not pending:
+                    continue
+                stats_payload = quantizer.export_percentile_stats()
+                if not isinstance(stats_payload, Mapping):
+                    canonical_module = rewrite_percentile_module_path(module_name)
+                    key = _format_quantizer_key(canonical_module, role, idx, total)
+                    logger.warning("[PercentileStats][warn] missing observer for %s", key)
+                    continue
+                quantizer.apply_percentile_stats(stats_payload)
+
+
 def enable(
     model,
     cfg: QuantConfig,
@@ -423,6 +577,8 @@ def enable(
     dumper: Optional[ActivationCallback] = None,
     targets: Optional[Iterable[str]] = None,
     strict_missing_stats: bool = False,
+    wrap_fake_quant: bool = False,
+    fake_quant_bits: Optional[Tuple[int, int]] = None,
 ) -> None:
     """Enable percentile clipping by registering forward hooks on ``model``."""
 
@@ -459,6 +615,11 @@ def enable(
         return
 
     disable(model)
+
+    if wrap_fake_quant:
+        fq_bits = fake_quant_bits or (cfg.weight_bits, cfg.act_bits)
+        percent_value = cfg.p_max
+        wrap_model_for_percentile(model, fq_bits[0], fq_bits[1], percent_value)
 
     observer_map: Dict[str, PercentileObserver]
     if normalized_mode == "collect":
