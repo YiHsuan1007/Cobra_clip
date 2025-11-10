@@ -354,6 +354,7 @@ def main() -> None:
             mode=args.mode,
             dumper=dumper.capture if dumper is not None else None,
             targets=user_targets,
+            wrap_fake_quant=(args.mode == "collect"),
         )
 
     try:
