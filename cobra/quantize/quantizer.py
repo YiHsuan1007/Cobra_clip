@@ -1,3 +1,4 @@
+import logging
 from re import U
 import torch
 import torch.nn as nn
@@ -288,10 +289,10 @@ class UniformAffineQuantizer(nn.Module):
 
         return scale.to(x.device), None if zero_point is None else zero_point.to(x.device)
 
-    def export_percentile_stats(self) -> Optional[Dict[str, Any]]:
+    def export_percentile_stats(self) -> Dict[str, Any]:
         """Return percentile statistics suitable for persistence."""
         if str(getattr(self, "mode", "")).lower() != "percentile":
-            return None
+            return {"pending": True}
 
         def _tensor_to_python(tensor: torch.Tensor) -> Any:
             tensor = tensor.detach().cpu()
@@ -318,7 +319,7 @@ class UniformAffineQuantizer(nn.Module):
             scale_tensor = getattr(self, "scale", None)
             zero_tensor = getattr(self, "round_zero_point", None)
             if not isinstance(scale_tensor, torch.Tensor) or scale_tensor.numel() == 0:
-                return None
+                return {"pending": True}
             scale_tensor = scale_tensor.detach().float().cpu()
             if isinstance(zero_tensor, torch.Tensor) and zero_tensor.numel() > 0:
                 zero_tensor = zero_tensor.detach().float().cpu()
@@ -339,7 +340,7 @@ class UniformAffineQuantizer(nn.Module):
         percent_key: Optional[str] = None
         if percent_value > 0.0:
             payload["percent"] = percent_value
-            percent_key = f"p{percent_value * 100:.6g}"
+            percent_key = f"p{percent_value * 100:.6g}".replace(".", "_")
 
         payload["min"] = _tensor_to_python(min_tensor)
         payload["max"] = _tensor_to_python(max_tensor)
@@ -349,6 +350,9 @@ class UniformAffineQuantizer(nn.Module):
             payload[percent_key] = clip_value
         else:
             payload["clip"] = clip_value
+        # Fill canonical bucket keys so downstream tools can pick the strongest threshold.
+        for key in ("p99", "p99_9", "p99_99", "p99_999"):
+            payload.setdefault(key, clip_value)
         return payload
 
     def apply_percentile_stats(self, stats: Mapping[str, Any]) -> None:
@@ -357,6 +361,8 @@ class UniformAffineQuantizer(nn.Module):
             return
         if not isinstance(stats, Mapping):
             raise TypeError("Percentile stats must be provided as a mapping.")
+        if stats.get("pending"):
+            return
 
         def _to_tensor(value: Any) -> torch.Tensor:
             tensor = torch.as_tensor(value, dtype=torch.float32)
@@ -364,76 +370,40 @@ class UniformAffineQuantizer(nn.Module):
                 tensor = tensor.reshape(1)
             return tensor
 
-        percent_candidates: List[tuple[float, Any]] = []
-        for key, value in stats.items():
-            if not isinstance(key, str):
-                continue
-            key_lower = key.lower()
-            if not key_lower.startswith("p"):
-                continue
-            try:
-                percent_val = float(key_lower[1:].replace("_", ""))
-            except ValueError:
-                continue
-            percent_candidates.append((percent_val, value))
-
-        if percent_candidates:
-            percent_candidates = sorted(percent_candidates, key=lambda item: item[0], reverse=True)
-            clip_value = percent_candidates[0][1]
-        else:
-            clip_value = stats.get("clip")
-
+        clip_value = stats.get("clip")
         min_value = stats.get("min")
         max_value = stats.get("max")
+
+        for key in ("p99_999", "p99_99", "p99_9", "p99"):
+            if key in stats:
+                clip_value = stats[key]
+                break
 
         clip_tensor = _to_tensor(clip_value) if clip_value is not None else None
         min_tensor = _to_tensor(min_value) if min_value is not None else None
         max_tensor = _to_tensor(max_value) if max_value is not None else None
 
-        if min_tensor is None and clip_tensor is not None:
-            min_tensor = -clip_tensor.clone()
-        if max_tensor is None and clip_tensor is not None:
-            max_tensor = clip_tensor.clone()
+        if clip_tensor is not None:
+            min_tensor = -clip_tensor
+            max_tensor = clip_tensor
 
         if min_tensor is None or max_tensor is None:
-            raise KeyError("Percentile stats must include `min`/`max` or percentile entries.")
+            return
 
-        if min_tensor.numel() != max_tensor.numel():
-            raise ValueError("Percentile stats `min` and `max` shapes do not match.")
-
-        numel = min_tensor.numel()
-        target_shape: Optional[torch.Size] = None
-        if isinstance(self.scale, torch.Tensor) and self.scale.numel() == numel:
-            target_shape = self.scale.shape
-        elif self.per_channel_axes and self._reference_shape is not None:
-            inferred = self._infer_scale_shape(numel)
-            if math.prod(inferred) == numel:
-                target_shape = inferred
-
-        if target_shape is not None:
-            min_tensor = min_tensor.reshape(target_shape)
-            max_tensor = max_tensor.reshape(target_shape)
-
-        device = None
-        if isinstance(self.scale, torch.Tensor):
-            device = self.scale.device
-        elif isinstance(self.round_zero_point, torch.Tensor):
-            device = self.round_zero_point.device
-
-        if device is not None:
-            min_tensor = min_tensor.to(device)
-            max_tensor = max_tensor.to(device)
+        device = self.scale.device if isinstance(getattr(self, "scale", None), torch.Tensor) else torch.device("cpu")
+        min_tensor = min_tensor.to(device=device, dtype=torch.float32)
+        max_tensor = max_tensor.to(device=device, dtype=torch.float32)
 
         if self.symmetric or self.disable_zero_point:
             abs_max = torch.max(max_tensor.abs(), min_tensor.abs())
-            xmin = -abs_max
-            xmax = abs_max
-            self.symmetric_cal_scale(xmin, xmax)
+            self.symmetric_cal_scale(-abs_max, abs_max)
         else:
             self.assymmetric_cal_scale(min_tensor, max_tensor)
 
-        self.observer = None
-        self.observered = True
+        if hasattr(self, "observer"):
+            self.observer = None
+        if hasattr(self, "observered"):
+            self.observered = True
         self.is_observing = False
         self._update_storage_shapes()
 
@@ -504,19 +474,61 @@ class UniformAffineQuantizer(nn.Module):
         if observer is None or not hasattr(observer, "calculate_qparams"):
             return None
         quant_param = observer.calculate_qparams(dtype_normalized, symmetric)
-        scale_tensor = quant_param.scale.detach().clone()
         existing_scale = getattr(self, "scale", None)
-        if isinstance(existing_scale, torch.Tensor) and existing_scale.numel() > 0:
+        existing_zero = getattr(self, "round_zero_point", None)
+
+        def _is_valid_tensor(candidate: Optional[torch.Tensor]) -> bool:
+            return (
+                isinstance(candidate, torch.Tensor)
+                and candidate.numel() > 0
+                and torch.isfinite(candidate.detach().float()).all()
+            )
+
+        def _resolve_label() -> str:
+            for attr in ("_quant_label", "_module_path", "_logical_path"):
+                value = getattr(self, attr, None)
+                if isinstance(value, str) and value:
+                    return value
+            return self.__class__.__name__
+
+        scale_tensor = getattr(quant_param, "scale", None)
+        zero_point = getattr(quant_param, "zero_point", None)
+
+        scale_valid = _is_valid_tensor(scale_tensor)
+        if not scale_valid:
+            if _is_valid_tensor(existing_scale):
+                logging.warning(
+                    "[Quant] Observer produced empty/invalid scale; preserving existing parameters for %s",
+                    _resolve_label(),
+                )
+                return quant_param
+            scale_tensor = torch.full((1,), CLIPMIN, dtype=torch.float32)
+            zero_point = None
+        else:
+            scale_tensor = scale_tensor.detach().clone()
+
+        if _is_valid_tensor(existing_scale):
             scale_tensor = scale_tensor.to(device=existing_scale.device, dtype=existing_scale.dtype)
         self.scale = scale_tensor
-        zero_point = quant_param.zero_point
-        if self.disable_zero_point or zero_point is None:
+
+        if self.disable_zero_point:
             self.round_zero_point = None
         else:
-            zero_tensor = zero_point.detach().clone()
-            if isinstance(existing_scale, torch.Tensor) and existing_scale.numel() > 0:
-                zero_tensor = zero_tensor.to(device=existing_scale.device)
-            self.round_zero_point = zero_tensor
+            zero_valid = _is_valid_tensor(zero_point)
+            if zero_valid:
+                zero_tensor = zero_point.detach().clone()
+                target_device = self.scale.device if isinstance(self.scale, torch.Tensor) else None
+                if target_device is not None:
+                    zero_tensor = zero_tensor.to(device=target_device)
+                self.round_zero_point = zero_tensor
+            elif _is_valid_tensor(existing_zero):
+                logging.warning(
+                    "[Quant] Observer produced empty/invalid zero-point; preserving existing parameters for %s",
+                    _resolve_label(),
+                )
+                self.round_zero_point = existing_zero
+            else:
+                self.round_zero_point = None
         self._update_storage_shapes()
         return quant_param
 

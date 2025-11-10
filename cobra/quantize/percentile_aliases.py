@@ -117,6 +117,12 @@ def expand_targets_for_hooks(names: Sequence[str]) -> List[str]:
     return expanded
 
 
+def has_hook_targets(name: str) -> bool:
+    """Return True when the canonical target participates in hook expansion."""
+    canonical = normalize_target_name(name)
+    return canonical in _HOOK_EXPANSION
+
+
 def normalize_stats_payload(stats: Dict[str, object]) -> Dict[str, object]:
     """Return a stats payload with canonical target naming applied."""
     if not isinstance(stats, dict):
