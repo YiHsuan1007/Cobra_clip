@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -16,7 +17,7 @@ from cobra import load as load_model
 from cobra.quantize.calibrate import _cast_float_payload, _extract_text_inputs, _move_to_device
 from cobra.quantize.config import QuantConfig
 from cobra.quantize.quantizer import UniformAffineQuantizer
-from cobra.quantize.percentile_aliases import normalize_target_name, expand_target_for_hooks
+from cobra.quantize.percentile_aliases import normalize_target_name, expand_target_for_hooks, normalize_targets
 from cobra.switches import quant_pct
 from cobra.utils.mem_peak import format_block, gather_peaks, init_peak_track
 from cobra.utils.latency_meter import LatencyMeter
@@ -144,12 +145,17 @@ def _tensor_to_python(value: torch.Tensor) -> Any:
 
 
 def _format_quantizer_key(module_name: str, role: str, index: int, total: int) -> str:
-    suffix = "" if total <= 1 else f"[{index}]"
-    return f"{module_name}.{role}{suffix}"
+    role_token = "weight" if role.startswith("weight") else "act"
+    if total <= 0:
+        raise ValueError("`total` must be positive when formatting quantizer keys.")
+    if index < 0 or index >= total:
+        raise IndexError(f"Quantizer index {index} out of range for total={total}.")
+    return f"{module_name}.{role_token}_quantizer.{index}"
 
 
-def _collect_percentile_quantizer_stats(model: nn.Module) -> Dict[str, Dict[str, Any]]:
-    stats: Dict[str, Dict[str, Any]] = {}
+def _collect_percentile_quantizer_stats(model: nn.Module) -> Tuple[OrderedDict[str, Dict[str, Any]], int]:
+    stats: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+    total_entries = 0
     for name, module in model.named_modules():
         if not name:
             continue
@@ -168,11 +174,14 @@ def _collect_percentile_quantizer_stats(model: nn.Module) -> Dict[str, Dict[str,
                 if not callable(exporter):
                     continue
                 payload = exporter()
-                if payload is None:
+                if not isinstance(payload, Mapping):
+                    continue
+                if payload.get("pending"):
                     continue
                 key = _format_quantizer_key(rewritten, role, idx, total)
-                stats[key] = payload
-    return stats
+                stats[key] = dict(payload)
+                total_entries += 1
+    return stats, total_entries
 
 
 def _build_target_stats(stats: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -362,12 +371,20 @@ def main() -> None:
     stats = quant_pct.calibrate(model, dataloader, cfg, targets=calibration_targets)
 
     if args.stats_out:
-        export_payload = _build_target_stats(stats)
-        export_payload.update(_collect_percentile_quantizer_stats(model))
+        export_payload = OrderedDict()
+        export_payload["config"] = cfg.to_dict()
+        export_payload["targets"] = normalize_targets(stats.get("targets") or [])
+        export_payload["observers"] = stats.get("observers", {})
+        quant_payload, quant_count = _collect_percentile_quantizer_stats(model)
+        export_payload.update(quant_payload)
         output_path = Path(args.stats_out).expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(export_payload, output_path)
-        print(f"[PercentileStats] Exported {len(export_payload)} entries to `{args.stats_out}`.")
+        file_size = output_path.stat().st_size
+        print(
+            f"[PercentileStats] Exported {quant_count} quantizer entries to `{args.stats_out}` "
+            f"(size={file_size / 1024:.1f} KiB)."
+        )
 
     observed_targets = stats.get("targets") or []
     sample_summary = ", ".join(

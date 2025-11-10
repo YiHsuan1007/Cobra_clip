@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import numbers
@@ -24,7 +25,6 @@ from cobra.quantize.calibrate import (
     _extract_text_inputs,
     _move_to_device,
     load_stats,
-    save_stats,
 )
 from cobra.quantize.config import QuantConfig
 from cobra.quantize.quantizer import UniformAffineQuantizer
@@ -48,6 +48,12 @@ from cobra.quantize.utils import (
     summarize_quantizer_init,
 )
 from cobra.quantize.percentile_aliases import normalize_targets, expand_targets_for_hooks, normalize_target_name
+from cobra.quantize.utils.percentile_to_overrides import (
+    apply_overrides as _apply_percentile_overrides,
+    build_percentile_overrides,
+    load_stats as _load_percentile_stats,
+    save_overrides as _save_percentile_overrides,
+)
 from cobra.utils.latency_meter import LatencyMeter
 from cobra.utils.mem_peak import init_peak_track
 
@@ -74,6 +80,7 @@ _CALIB_SOURCE_GUIDANCE = (
 
 _DEFAULT_TARGET_PREFIXES: Tuple[str, ...] = ("vision.dino", "vision.siglip", "mm.out")
 _DEFAULT_CANONICAL_TARGETS: Tuple[str, ...] = ("vision_backbone", "llm_backbone", "projector")
+_DEFAULT_OVERRIDES_PATH = Path("outputs/best_percentile_map.pt")
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +193,80 @@ def _emit_calibration_logs(model: nn.Module) -> int:
     if emitted == 0:
         print("[calibrate] <no_quantizers>: observer=none, clip=(0, 0), scale=[0, 0], zero_point=None")
     return emitted
+
+
+def _export_int_weights(model: nn.Module, export_dir: Path) -> Optional[Path]:
+    export_dir.mkdir(parents=True, exist_ok=True)
+    payload: Dict[str, Dict[str, torch.Tensor]] = {}
+    for module_name, module in model.named_modules():
+        if not isinstance(module, (QuantLinear, QuantConvBase, QuantMatMul)):
+            continue
+        weight_int = getattr(module, "weight_int", None)
+        if not isinstance(weight_int, torch.Tensor) or weight_int.numel() == 0:
+            continue
+        entry: Dict[str, torch.Tensor] = {"weight_int": weight_int.detach().cpu()}
+        for attr in ("w_scale", "w_zero"):
+            tensor = getattr(module, attr, None)
+            if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+                entry[attr] = tensor.detach().cpu()
+        payload[module_name] = entry
+    if not payload:
+        logger.info("[export] No INT weights detected; skipping export to %s", export_dir)
+        return None
+    target = export_dir / "int8_weights.pt"
+    torch.save(payload, target)
+    return target
+
+
+def _summarize_override_entries(
+    model: nn.Module,
+    overrides: Mapping[str, Mapping[str, object]],
+    limit: int = 10,
+) -> Tuple[int, int, List[Tuple[str, float]]]:
+    named_modules = dict(model.named_modules())
+    preview: List[Tuple[str, float]] = []
+    linear_count = 0
+    conv_count = 0
+
+    for override_key, payload in overrides.items():
+        if not isinstance(override_key, str) or "." not in override_key:
+            continue
+        module_name, attr = override_key.rsplit(".", 1)
+        module = named_modules.get(module_name)
+        if module is None or not isinstance(payload, Mapping):
+            continue
+        percentile_value = payload.get("percentile", payload.get("percent"))
+        if percentile_value is None:
+            continue
+        try:
+            percentile_float = float(percentile_value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(module, QuantLinear):
+            linear_count += 1
+        elif isinstance(module, QuantConvBase):
+            conv_count += 1
+        else:
+            continue
+        if len(preview) < limit:
+            preview.append((f"{module_name}.{attr}", percentile_float))
+    return linear_count, conv_count, preview
+
+
+def _emit_override_report(
+    model: nn.Module,
+    overrides: Mapping[str, Mapping[str, object]],
+    applied_count: int,
+    label: str = "PercentileOverrides",
+) -> None:
+    if applied_count <= 0 or not overrides:
+        return
+    linear_count, conv_count, preview = _summarize_override_entries(model, overrides)
+    if preview:
+        print(f"[{label}] sample overrides:")
+        for module_name, percentile in preview:
+            print(f"  - {module_name} -> percentile=p{percentile:.4g}")
+    print(f"[QuantPct][apply] overrides_applied={applied_count} linear={linear_count} conv={conv_count}")
 
 
 def _normalize_apply_targets(user_targets: Any) -> str:
@@ -1123,9 +1204,10 @@ def _apply_percentile_stats_from_file(stats_path: Path | str, model: nn.Module) 
         )
 
     logging.info("[PercentileStats] Applied %d percentile quantizer entries from %s.", applied, resolved)
+    return applied
 
 
-def _load_and_apply_percentile_stats(model: nn.Module, stats_path: str) -> None:
+def _load_and_apply_percentile_stats(model: nn.Module, stats_path: str) -> int:
     """
     讀入 Step 1 產生的百分位統計，支援單檔或資料夾輸入，並套用到模型上的 percentile quantizer。
     """
@@ -1141,11 +1223,12 @@ def _load_and_apply_percentile_stats(model: nn.Module, stats_path: str) -> None:
             raise FileNotFoundError(
                 f"No percentile stats files found under '{resolved}'. Expected one of: {', '.join(sorted(suffixes))}."
             )
+        applied_total = 0
         for candidate in candidates:
-            _apply_percentile_stats_from_file(candidate, model)
-        return
+            applied_total += _apply_percentile_stats_from_file(candidate, model)
+        return applied_total
 
-    _apply_percentile_stats_from_file(resolved, model)
+    return _apply_percentile_stats_from_file(resolved, model)
 
 
 def assert_finalized(model: nn.Module) -> Tuple[int, List[str]]:
@@ -1386,7 +1469,60 @@ def parse_args() -> argparse.Namespace:
         "--stats-in",
         type=str,
         default=None,
-        help="Path to percentile stats .json or a dir containing them.",
+        help="Path to percentile stats payload (takes precedence when provided).",
+    )
+    parser.add_argument(
+        "--stats-path",
+        type=str,
+        default=None,
+        help="Fallback percentile stats path used when --stats-in is not set.",
+    )
+    parser.add_argument(
+        "--stats-out",
+        type=str,
+        default=None,
+        help="Output path for percentile stats when running in collect mode.",
+    )
+    parser.add_argument(
+        "--percentile-stats",
+        type=str,
+        default=None,
+        help="Stage-level percentile stats (.pt) used to derive per-module overrides when needed.",
+    )
+    parser.add_argument(
+        "--percentile-overrides",
+        type=str,
+        default=str(_DEFAULT_OVERRIDES_PATH),
+        help="Path to a per-module percentile override map (.pt).",
+    )
+    parser.add_argument(
+        "--export-best-percentile-map",
+        type=str,
+        default=str(_DEFAULT_OVERRIDES_PATH),
+        help="Where to write the derived percentile override map during collect mode.",
+    )
+    parser.add_argument(
+        "--policy",
+        choices=("auto", "fixed"),
+        default="auto",
+        help="Percentile override policy passed to the builder.",
+    )
+    parser.add_argument(
+        "--default-p",
+        choices=("99.0", "99.9", "99.99", "99.999"),
+        default="99.9",
+        help="Fallback percentile used when deriving overrides.",
+    )
+    parser.add_argument(
+        "--skip-recalib-when-applied",
+        type=_parse_bool_arg,
+        default=True,
+        help="Skip short fake-quant replay when percentile overrides already populated quantizers.",
+    )
+    parser.add_argument(
+        "--export-percentile-stats",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--lazy-init-via-fakequant",
@@ -1551,6 +1687,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run calibration replay and parameter export without enabling INT execution.",
     )
+    parser.add_argument(
+        "--export-int",
+        type=str,
+        default=None,
+        help="Directory used to export INT8 weights once real-quant conversion completes (apply mode only).",
+    )
     return parser.parse_args()
 
 
@@ -1593,11 +1735,36 @@ def _run_replacement(
 
 def main() -> None:
     args = parse_args()
-    if args.real_quant and not getattr(args, "stats_in", None):
-        warning = "[Warning] Real-int mode requires precomputed percentile stats or prior calibration."
+    if isinstance(getattr(args, "default_p", None), str):
+        try:
+            args.default_p = float(args.default_p)
+        except ValueError:
+            args.default_p = 99.9
+    deprecated_stats_flag = getattr(args, "export_percentile_stats", None)
+    if deprecated_stats_flag:
+        warning = (
+            "[Deprecated] --export-percentile-stats is ignored; use --export-best-percentile-map instead."
+        )
         print(warning)
         logger.warning(warning)
-        args.real_quant = False
+    export_request = getattr(args, "export_int", None)
+    if args.mode.lower() == "collect" and not getattr(args, "stats_out", None):
+        raise RuntimeError("--stats-out is required when running in collect mode.")
+    if export_request and args.mode != "apply":
+        message = "[export] --export-int is only supported when --mode apply is active; ignoring request."
+        print(message)
+        logger.warning(message)
+        args.export_int = None
+    elif export_request and not args.real_quant:
+        message = "[export] --export-int requires --real-quant so INT weights exist; ignoring request."
+        print(message)
+        logger.warning(message)
+        args.export_int = None
+    stats_source = getattr(args, "stats_in", None) or getattr(args, "stats_path", None)
+    if args.mode.lower() == "apply" and not stats_source:
+        warning = "[Warning] Percentile stats not provided (--stats-in/--stats-path missing); proceeding without them."
+        print(warning)
+        logger.warning(warning)
 
     lat_repeat = max(1, int(getattr(args, "repeat", 1)))
     lat_warmup = max(0, int(getattr(args, "warmup", 0)))
@@ -1621,21 +1788,9 @@ def main() -> None:
 
     start_time = init_peak_track()
     cfg = QuantConfig.from_file(args.cfg)
-
-    #測試
-    print("CFG TYPE =", type(cfg))
-    print("HAS model_copy:", hasattr(cfg, "model_copy"))
-    try:
-        import dataclasses
-        print("IS DATACLASS:", dataclasses.is_dataclass(cfg))
-    except Exception:
-        pass
-    try:
-        from omegaconf import OmegaConf
-        print("IS OMEGACONF:", isinstance(cfg, (OmegaConf.__class__,)))
-    except Exception:
-        pass
-    #測試
+    stats_override = getattr(args, "stats_path", None)
+    if stats_override:
+        cfg.stats_path = str(Path(stats_override).expanduser())
 
     if args.weight_bits is not None:
         cfg.weight_bits = int(args.weight_bits)
@@ -1791,11 +1946,7 @@ def main() -> None:
             f"[MatMulQuant][verbose] After replacement: modules={module_count_after} "
             f"(delta={delta})"
         )
-    if not matmul_replacements:
-        logger.info(
-            "MatMul=0. 可能原因: (a) attention 使用 Linear 路徑已量化，(b) 目標前綴未覆蓋到 helper，(c) 本模型未顯式使用 torch.matmul。"
-        )
-
+        
     quant_linear_count = 0
     quant_conv_count = 0
     quant_matmul_count = 0
@@ -1844,17 +1995,49 @@ def main() -> None:
         fake_replay_processed = 0
         fake_replay_quant_map: Optional[Dict[int, tuple[UniformAffineQuantizer, str]]] = None
         synthetic_replay = False
+        overrides_applied = 0
+        overrides_source = getattr(args, "percentile_overrides", None) or str(_DEFAULT_OVERRIDES_PATH)
+        overrides_path = Path(overrides_source).expanduser()
+        primary_stats_source = getattr(args, "stats_in", None) or getattr(args, "stats_path", None)
+        if overrides_path.exists():
+            try:
+                overrides_applied = _apply_percentile_overrides(model, str(overrides_path))
+                print(
+                    f"[PercentileOverrides] Applied {overrides_applied} entries from `{overrides_path}`."
+                )
+                if overrides_applied > 0:
+                    try:
+                        overrides_payload = torch.load(overrides_path, map_location="cpu")
+                    except Exception:
+                        overrides_payload = {}
+                    if isinstance(overrides_payload, Mapping):
+                        _emit_override_report(model, overrides_payload, overrides_applied)
+                    if getattr(args, "skip_recalib_when_applied", True):
+                        need_replay = False
+                        print("[PercentileOverrides] Skip short fake-quant replay (overrides applied).")
+                else:
+                    print("[PercentileOverrides] Override map contained 0 entries; continuing with replay.")
+            except Exception as exc:
+                print(f"[PercentileOverrides] Failed to apply overrides from {overrides_path}: {exc}")
+                logger.warning("Failed to apply percentile overrides at %s: %s", overrides_path, exc, exc_info=True)
+        else:
+            print(
+                f"[PercentileOverrides] Override map not found at {overrides_path}; "
+                "will rely on calibration replay."
+            )
 
-        if args.stats_in:
-            _load_and_apply_percentile_stats(model, args.stats_in)
+        if primary_stats_source:
+            _load_and_apply_percentile_stats(model, primary_stats_source)
             stats_loaded_early = True
-            need_replay = not args.skip_recalib
             if args.skip_recalib:
+                need_replay = False
                 print("[Step2] Loaded percentile stats from --stats-in; skip fake-quant replay.")
-            else:
+            elif need_replay:
                 print("[Step2] Loaded stats; will still run short fake-quant replay unless --skip-recalib is set.")
-        elif args.skip_recalib and not args.lazy_init_via_fakequant:
-            raise RuntimeError("[Step2] No calib data. Provide --calib-data or use --stats-in with --skip-recalib.")
+        elif args.skip_recalib and not args.lazy_init_via_fakequant and overrides_applied == 0:
+            raise RuntimeError(
+                "[Step2] Missing overrides and stats. Provide --calib-data or supply --percentile-overrides."
+            )
         elif args.lazy_init_via_fakequant:
             need_replay = True
 
@@ -2096,7 +2279,7 @@ def main() -> None:
         set_static_quant(model, static_quant=True)
         if getattr(args, "stats_in", None) and not stats_loaded_early:
             print(f"[RealQuant] Loading percentile stats from {args.stats_in}")
-            _load_and_apply_percentile_stats(model, args.stats_in)
+            _ = _load_and_apply_percentile_stats(model, args.stats_in)
             if args.lazy_init_via_fakequant:
                 remaining_after_stats = count_uninitialized_quantizers(model)
                 if remaining_after_stats > 0:
@@ -2160,36 +2343,44 @@ def main() -> None:
                 set_quant_state(model, weight_quant=True, act_quant=False)
                 set_quant_state(model, observer=True)
             _apply_quant_state(True, True, observer=False)
-            if args.dry_run_real_quant:
-                print("[RealQuant] Dry-run complete; INT execution not enabled.")
-            elif args.real_quant:
-                print(
-                    "[RealQuant] Switching to INT execution "
-                    f"(propagate_int={args.propagate_int}, int_kernel={args.int_kernel})."
-                )
-                if args.int_kernel:
-                    logger.info("[RealQuant] Integer kernel requested; enabling for supported modules.")
-                pre_quant_state = {
-                    "use_weight_quant": getattr(model, "use_weight_quant", None),
-                    "use_act_quant": getattr(model, "use_act_quant", None),
-                }
-                print(
-                    "[RealQuant] Model quant flags before switch: "
-                    + ", ".join(f"{k}={v}" for k, v in pre_quant_state.items())
-                )
-                convert_to_int(
-                    model,
-                    propagate_int=args.propagate_int,
-                    use_int_kernel=args.int_kernel,
-                )
-                post_quant_state = {
-                    "use_weight_quant": getattr(model, "use_weight_quant", None),
-                    "use_act_quant": getattr(model, "use_act_quant", None),
-                }
-                print(
-                    "[RealQuant] INT mode enabled successfully. "
-                    + ", ".join(f"{k}={v}" for k, v in post_quant_state.items())
-                )
+        if args.dry_run_real_quant:
+            print("[RealQuant] Dry-run complete; INT execution not enabled.")
+            if args.export_int:
+                print("[export] --export-int requested but dry-run mode skipped INT conversion; nothing exported.")
+        elif args.real_quant:
+            print(
+                "[RealQuant] Switching to INT execution "
+                f"(propagate_int={args.propagate_int}, int_kernel={args.int_kernel})."
+            )
+            if args.int_kernel:
+                logger.info("[RealQuant] Integer kernel requested; enabling for supported modules.")
+            pre_quant_state = {
+                "use_weight_quant": getattr(model, "use_weight_quant", None),
+                "use_act_quant": getattr(model, "use_act_quant", None),
+            }
+            print(
+                "[RealQuant] Model quant flags before switch: "
+                + ", ".join(f"{k}={v}" for k, v in pre_quant_state.items())
+            )
+            convert_to_int(
+                model,
+                propagate_int=args.propagate_int,
+                use_int_kernel=args.int_kernel,
+            )
+            post_quant_state = {
+                "use_weight_quant": getattr(model, "use_weight_quant", None),
+                "use_act_quant": getattr(model, "use_act_quant", None),
+            }
+            print(
+                "[RealQuant] INT mode enabled successfully. "
+                + ", ".join(f"{k}={v}" for k, v in post_quant_state.items())
+            )
+            if args.mode == "apply" and args.export_int:
+                export_path = _export_int_weights(model, Path(args.export_int).expanduser())
+                if export_path is not None:
+                    message = f"[export] Exported INT8 weights to {export_path}"
+                    logger.info(message)
+                    print(message)
             _log_real_quant_stage(model, "(D) enable_real_int")
     elif args.int_kernel:
         print("[IntKernel] --int-kernel requested without --real-quant; ignoring.")
@@ -2386,8 +2577,16 @@ def main() -> None:
         else:
             if args.mode == "collect":
                 stats_path_value = getattr(cfg, "stats_path", None)
+                if stats_path_value:
+                    warning = (
+                        "[QuantPct][collect] Percentile stats export is deprecated; ignoring "
+                        f"--stats-path={stats_path_value}."
+                    )
+                    print(warning)
+                    logger.warning(warning)
                 observer_attr = getattr(model, "_quant_pct_observers", None)
-                if stats_path_value and isinstance(observer_attr, Mapping) and observer_attr:
+                stage_stats_payload: Optional[Dict[str, Any]] = None
+                if isinstance(observer_attr, Mapping) and observer_attr:
                     collected: Dict[str, Dict[str, Any]] = {}
                     for key, observer in observer_attr.items():
                         if not hasattr(observer, "state_dict"):
@@ -2401,49 +2600,29 @@ def main() -> None:
                         collected[canonical_key] = state_dict
 
                     if collected:
-                        try:
-                            current_stats = load_stats(stats_path_value)
-                        except Exception:
-                            current_stats = {}
-                        if not isinstance(current_stats, dict):
-                            current_stats = {}
-
-                        existing_targets = current_stats.get("targets")
-                        normalized_existing: List[str] = []
-                        if isinstance(existing_targets, Iterable) and not isinstance(
-                            existing_targets, (str, bytes)
-                        ):
-                            try:
-                                normalized_existing = list(normalize_targets(existing_targets))
-                            except Exception:
-                                normalized_existing = []
-
-                        if not normalized_existing:
-                            normalized_existing = list(normalize_targets(enable_targets)) if enable_targets else list(
-                                collected.keys()
-                            )
-
-                        observers_block = current_stats.get("observers")
-                        if not isinstance(observers_block, dict):
-                            observers_block = {}
-                        observers_block.update(collected)
-
-                        current_stats["observers"] = observers_block
-                        current_stats["targets"] = normalized_existing
-                        current_stats.setdefault("config", cfg.to_dict())
-                        save_stats(current_stats, stats_path_value)
-                        print(
-                            "[QuantPct][collect] "
-                            f"Saved percentile stats to {stats_path_value} with targets={','.join(normalized_existing)}"
+                        normalized_existing = (
+                            list(normalize_targets(enable_targets)) if enable_targets else list(collected.keys())
                         )
+                        stage_stats_payload = {
+                            "observers": collected,
+                            "targets": normalized_existing,
+                            "config": cfg.to_dict(),
+                        }
 
-                if stats_path_value:
-                    _log_stats_summary_from_path(
-                        Path(stats_path_value),
-                        stage="collect:written_file",
-                        warn_if_no_observers=True,
+                export_map_value = getattr(args, "export_best_percentile_map", None)
+                if export_map_value:
+                    export_path = str(Path(export_map_value).expanduser())
+                    overrides_payload = build_percentile_overrides(
+                        model,
+                        stage_stats_payload,
+                        policy=getattr(args, "policy", "auto"),
+                        default_p=getattr(args, "default_p", 99.9),
                     )
-            quant_pct.disable(model)
+                    _save_percentile_overrides(export_path, overrides_payload)
+                    print(
+                        f"[PercentileOverrides] Exported {len(overrides_payload)} entries to `{export_path}`."
+                    )
+        quant_pct.disable(model)
 
         out_dir_value = getattr(args, "out", None)
         out_dir = Path(out_dir_value) if out_dir_value else None

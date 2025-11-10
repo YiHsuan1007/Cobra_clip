@@ -16,7 +16,30 @@ DEFAULT_PERCENTILE_TARGET_MAP: Dict[str, str] = {
     "vision.siglip": "vision_backbone.tap_post_siglip",
     "mm.out": "tap_post_mm_out",
 }
-DEFAULT_PERCENTILE_TARGETS: Sequence[str] = tuple(DEFAULT_PERCENTILE_TARGET_MAP.keys())
+_TARGET_PREFIX_EXPANSION: Dict[str, Sequence[str]] = {
+    "vision_backbone": ("vision.dino", "vision.siglip"),
+    "projector": ("mm.out",),
+    "llm_backbone": tuple(),
+}
+_DEFAULT_TARGET_SEQUENCE: Sequence[str] = tuple(DEFAULT_PERCENTILE_TARGET_MAP.keys())
+DEFAULT_PERCENTILE_TARGETS: Sequence[str] = tuple(
+    dict.fromkeys((*_TARGET_PREFIX_EXPANSION.keys(), *_DEFAULT_TARGET_SEQUENCE))
+)
+
+
+def _expand_target_names(candidates: Sequence[str]) -> List[str]:
+    expanded: List[str] = []
+    seen: set[str] = set()
+    for name in candidates:
+        bundle = _TARGET_PREFIX_EXPANSION.get(name, (name,))
+        for leaf in bundle:
+            if leaf not in DEFAULT_PERCENTILE_TARGET_MAP:
+                continue
+            if leaf in seen:
+                continue
+            seen.add(leaf)
+            expanded.append(leaf)
+    return expanded
 
 
 def _make_activation_hook(
@@ -95,7 +118,9 @@ def attach_percentile_hooks(
     else:
         selected_targets = DEFAULT_PERCENTILE_TARGETS
 
-    for name in selected_targets:
+    expanded_targets = _expand_target_names(selected_targets)
+
+    for name in expanded_targets:
         if name not in DEFAULT_PERCENTILE_TARGET_MAP:
             raise KeyError(f"Unknown percentile target `{name}`.")
         if name not in observers:
@@ -113,3 +138,4 @@ def attach_percentile_hooks(
 def remove_handles(handles: Iterable[RemovableHandle]) -> None:
     for handle in handles:
         handle.remove()
+
