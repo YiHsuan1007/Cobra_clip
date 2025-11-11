@@ -12,12 +12,13 @@ import warnings
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import inspect
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from difflib import get_close_matches
 
 from cobra.integration.hooks import (
     DEFAULT_PERCENTILE_TARGET_MAP,
@@ -57,6 +58,51 @@ from cobra.quantize.utils import (
 )
 from cobra.quantize.quantizer import UniformAffineQuantizer
 from cobra.quantize.utils.dtype import force_calib_dtype, scoped_no_autocast
+
+
+def _patch_percentile_observer_hit_counter() -> None:
+    if getattr(PercentileObserver, "_quant_pct_hit_counter", False):
+        return
+
+    original_update = PercentileObserver.update
+    original_get_clip = PercentileObserver.get_clip_value
+    original_state_dict = PercentileObserver.state_dict
+    original_load_state_dict = PercentileObserver.load_state_dict
+
+    @functools.wraps(original_update)
+    def _update_with_hits(self, *args, **kwargs):
+        self._hit_count = getattr(self, "_hit_count", 0) + 1
+        return original_update(self, *args, **kwargs)
+
+    @functools.wraps(original_get_clip)
+    def _get_clip_with_hits(self, *args, **kwargs):
+        result = original_get_clip(self, *args, **kwargs)
+        if result is not None:
+            self._hit_count = getattr(self, "_hit_count", 0) + 1
+        return result
+
+    @functools.wraps(original_state_dict)
+    def _state_dict_with_hits(self, *args, **kwargs):
+        payload = original_state_dict(self, *args, **kwargs)
+        payload["hit_count"] = int(getattr(self, "_hit_count", 0))
+        return payload
+
+    @functools.wraps(original_load_state_dict)
+    def _load_state_dict_with_hits(self, state: Dict[str, Any], *args, **kwargs):
+        original_load_state_dict(self, state, *args, **kwargs)
+        try:
+            self._hit_count = int(state.get("hit_count", 0) or 0)
+        except Exception:
+            self._hit_count = 0
+
+    PercentileObserver.update = _update_with_hits  # type: ignore[assignment]
+    PercentileObserver.get_clip_value = _get_clip_with_hits  # type: ignore[assignment]
+    PercentileObserver.state_dict = _state_dict_with_hits  # type: ignore[assignment]
+    PercentileObserver.load_state_dict = _load_state_dict_with_hits  # type: ignore[assignment]
+    setattr(PercentileObserver, "_quant_pct_hit_counter", True)
+
+
+_patch_percentile_observer_hit_counter()
 
 __all__ = [
     "calibrate",
@@ -259,24 +305,6 @@ def _normalize_target_list(targets: Sequence[str]) -> List[str]:
     return list(normalize_targets(targets))
 
 
-def _format_quantizer_key(module_name: str, role: str, idx: int, total: int) -> str:
-    """
-    Return the canonical percentile key used for a quantizer attribute.
-
-    ``module_name`` must be the dotted path reported by ``named_modules()``.
-    ``role`` is normalised to ``weight`` or ``act``.
-    ``idx`` enumerates quantizers when multiple exist under the same attribute.
-    """
-
-    if total <= 0:
-        raise ValueError("`total` must be positive when formatting quantizer keys.")
-    if idx < 0 or idx >= total:
-        raise IndexError(f"Quantizer index {idx} is out of range for total={total}.")
-
-    normalized_role = "weight" if str(role).lower().startswith("weight") else "act"
-    return f"{module_name}.{normalized_role}_quantizer.{idx}"
-
-
 def _iter_percentile_quantizers(module: nn.Module, attr: str) -> List[UniformAffineQuantizer]:
     return [
         quant
@@ -294,6 +322,94 @@ def _replace_module(root: nn.Module, path: str, new_module: nn.Module) -> None:
     for part in parts[:-1]:
         parent = getattr(parent, part)
     setattr(parent, parts[-1], new_module)
+
+
+def canonical_quant_key(module_path: str, role: str) -> str:
+    assert role in ("weight_quantizer", "act_quantizer"), role
+    cleaned = module_path.strip(".")
+    return f"{cleaned}.{role}"
+
+
+def nearest_keys(missing: str, pool: List[str], k: int = 3) -> List[str]:
+    return get_close_matches(missing, pool, n=k, cutoff=0.0)
+
+
+def build_stats_summary(stats: Mapping[str, Any], *, per_quantizer_entries: int) -> Dict[str, Any]:
+    observers = stats.get("observers", {})
+    observed_layers = 0
+    for payload in observers.values():
+        if not isinstance(payload, Mapping):
+            continue
+        hit = payload.get("hit_count")
+        if hit is None:
+            numel = payload.get("numel", 0)
+            hit = 1 if numel else 0
+        try:
+            hit_value = int(hit)
+        except Exception:
+            hit_value = 0
+        if hit_value > 0:
+            observed_layers += 1
+    summary = {
+        "observed_layers": observed_layers,
+        "per_quantizer_entries": int(per_quantizer_entries),
+        "samples": list(observers.keys())[:3] if isinstance(observers, Mapping) else [],
+    }
+    try:
+        stats["_summary"] = summary  # type: ignore[index]
+    except Exception:
+        pass
+    return summary
+
+
+def select_percentile(observer: Mapping[str, Any], pct_override: Optional[float]) -> Optional[str]:
+    percentiles = observer.get("percentiles")
+    if not isinstance(percentiles, Mapping) or not percentiles:
+        return None
+    percentiles = {str(k): v for k, v in percentiles.items()}
+
+    def _fmt(value: float) -> str:
+        formatted = f"{value}".rstrip("0").rstrip(".")
+        if formatted.startswith("p"):
+            return formatted
+        return f"p{formatted}"
+
+    if pct_override is not None:
+        key = _fmt(pct_override)
+        if key in percentiles:
+            return key
+    for candidate in ("p99.999", "p99.99", "p99.9", "p99"):
+        if candidate in percentiles:
+            return candidate
+    return None
+
+
+def validate_quantizers(model: nn.Module) -> Tuple[int, int]:
+    checked = 0
+    failed = 0
+
+    def _is_invalid(scale: Any) -> bool:
+        if scale is None:
+            return True
+        if hasattr(scale, "numel"):
+            try:
+                return int(scale.numel()) == 0
+            except Exception:
+                return False
+        return False
+
+    for module in model.modules():
+        weight_q = getattr(module, "weight_quantizer", None)
+        if weight_q is not None:
+            checked += 1
+            if _is_invalid(getattr(weight_q, "scale", None)):
+                failed += 1
+        act_q = getattr(module, "act_quantizer", None)
+        if act_q is not None:
+            checked += 1
+            if _is_invalid(getattr(act_q, "scale", None)):
+                failed += 1
+    return checked, failed
 
 
 def _iter_named_modules_flex(model: nn.Module) -> Iterator[Tuple[str, nn.Module]]:
@@ -361,6 +477,7 @@ def export_percentile_quantizers(
     entries: OrderedDict[str, Dict[str, Any]] = OrderedDict()
     exported = 0
     for module_name, role, quant in iter_percentile_quantizers(model):
+        attr_name = "weight_quantizer" if role == "weight" else "act_quantizer"
         exporter = getattr(quant, "export_percentile_stats", None)
         if not callable(exporter):
             continue
@@ -368,7 +485,7 @@ def export_percentile_quantizers(
         if not payload:
             continue
         rewritten = rewrite_percentile_module_path(module_name)
-        key = f"{rewritten}.{role}_quantizer"
+        key = canonical_quant_key(rewritten, attr_name)
         entries[key] = dict(payload)
         exported += 1
 
@@ -388,7 +505,71 @@ def export_percentile_quantizers(
     return exported, entries
 
 
-def _load_and_apply_percentile_stats(model: nn.Module, path: str, logger: logging.Logger) -> Tuple[int, int]:
+def _apply_percentile_stats_payload(
+    model: nn.Module,
+    payload: Mapping[str, Any],
+    logger: logging.Logger,
+    *,
+    apply_denylist: Optional[Collection[str]] = None,
+) -> Tuple[int, int]:
+    if not isinstance(payload, Mapping):
+        logger.warning("[PercentileStats] Payload is not a mapping.")
+        return 0, 0
+
+    payload = dict(payload)
+    for key in list(payload.keys()):
+        if not isinstance(key, str) or "::" not in key:
+            continue
+        head, _, tail = key.partition("::")
+        if head in {"target", "observer"} and tail and tail not in payload:
+            payload[tail] = payload[key]
+
+    applied = 0
+    missing = 0
+    denylist: Set[str] = set(apply_denylist or ())
+    for module_name, module in _safe_named_modules(model):
+        if not module_name:
+            continue
+        canonical_module = rewrite_percentile_module_path(module_name)
+        for role, attr in (("weight", "weight_quantizer"), ("act", "act_quantizer")):
+            quantizers = _iter_percentile_quantizers(module, attr)
+            if not quantizers:
+                continue
+            key = canonical_quant_key(canonical_module, attr)
+            if key in denylist:
+                continue
+            stats_entry = payload.get(key)
+            if stats_entry is None and canonical_module != module_name:
+                legacy_key = canonical_quant_key(module_name, attr)
+                if legacy_key in denylist:
+                    continue
+                stats_entry = payload.get(legacy_key)
+                if stats_entry is not None:
+                    key = legacy_key
+            if isinstance(stats_entry, Mapping):
+                for quantizer in quantizers:
+                    try:
+                        quantizer.apply_percentile_stats(stats_entry)
+                        applied += 1
+                    except Exception as exc:
+                        logger.debug("[PercentileStats] Failed to apply %s: %s", key, exc)
+                        missing += 1
+                continue
+            missing += len(quantizers)
+
+    message = f"[PercentileStats] Applied {applied} quantizer entries (missing={missing})"
+    logger.info(message)
+    print(message)
+    return applied, missing
+
+
+def _load_and_apply_percentile_stats(
+    model: nn.Module,
+    path: str,
+    logger: logging.Logger,
+    *,
+    apply_denylist: Optional[Collection[str]] = None,
+) -> Tuple[int, int]:
     resolved = Path(path).expanduser()
     if not resolved.exists():
         logger.warning("[PercentileStats] File not found: %s", resolved)
@@ -402,45 +583,13 @@ def _load_and_apply_percentile_stats(model: nn.Module, path: str, logger: loggin
         logger.warning("[PercentileStats] Payload at %s is not a mapping.", resolved)
         return 0, 0
 
-    payload = dict(payload)
-    for key in list(payload.keys()):
-        if not isinstance(key, str) or "::" not in key:
-            continue
-        head, _, tail = key.partition("::")
-        if head in {"target", "observer"} and tail and tail not in payload:
-            payload[tail] = payload[key]
-
-    applied = 0
-    missing = 0
-    for module_name, module in _safe_named_modules(model):
-        if not module_name:
-            continue
-        canonical_module = rewrite_percentile_module_path(module_name)
-        for role, attr in (("weight", "weight_quantizer"), ("act", "act_quantizer")):
-            quantizers = _iter_percentile_quantizers(module, attr)
-            total = len(quantizers)
-            if total == 0:
-                continue
-            for idx, quantizer in enumerate(quantizers):
-                key = _format_quantizer_key(canonical_module, role, idx, total)
-                stats_entry = payload.get(key)
-                if stats_entry is None and canonical_module != module_name:
-                    legacy_key = _format_quantizer_key(module_name, role, idx, total)
-                    stats_entry = payload.get(legacy_key)
-                    if stats_entry is not None:
-                        key = legacy_key
-                if isinstance(stats_entry, Mapping):
-                    try:
-                        quantizer.apply_percentile_stats(stats_entry)
-                        applied += 1
-                        continue
-                    except Exception as exc:
-                        logger.debug("[PercentileStats] Failed to apply %s: %s", key, exc)
-                missing += 1
-
-    message = f"[PercentileStats] Applied {applied} quantizer entries from {resolved} (missing={missing})"
-    logger.info(message)
-    print(message)
+    applied, missing = _apply_percentile_stats_payload(
+        model,
+        payload,
+        logger,
+        apply_denylist=apply_denylist,
+    )
+    logger.info(f"[PercentileStats] Source {resolved}: applied={applied} missing={missing}")
     return applied, missing
 
 
@@ -620,6 +769,7 @@ def normalize_stats_format(raw: Dict[str, Any]) -> Dict[str, Any]:
 def _collect_observers(
     stats: dict,
     cfg: QuantConfig,
+    pct_override: Optional[float] = None,
 ) -> Tuple[Dict[str, PercentileObserver], List[Tuple[str, List[str], List[str]]]]:
     stats = normalize_stats_format(stats)
     observers = stats.get("observers", {})
@@ -634,6 +784,7 @@ def _collect_observers(
         else:
             expanded_targets.append(target)
     lookup_targets = _normalize_target_list(expanded_targets)
+    pct_override = cfg.__dict__.get("_quant_pct_pct_override", pct_override)
     result: Dict[str, PercentileObserver] = {}
     missing: List[Tuple[str, List[str], List[str]]] = []
     available_keys = [str(key) for key in observers.keys()]
@@ -649,7 +800,33 @@ def _collect_observers(
             missing.append((canonical_name, candidates, available_keys))
             continue
         canonical_name = normalize_target_name(name)
-        result[canonical_name] = _build_observer(state, cfg, target=canonical_name)
+        state_dict = dict(state)
+        selected_key = select_percentile(state_dict, pct_override)
+        percent_map = state_dict.get("percentiles")
+        clip_value: Optional[float] = None
+        if selected_key and isinstance(percent_map, Mapping):
+            clip_candidate = percent_map.get(selected_key)
+            if clip_candidate is not None:
+                try:
+                    clip_value = abs(float(clip_candidate))
+                except Exception:
+                    clip_value = None
+        if clip_value is None:
+            clip_min = state_dict.get("min")
+            clip_max = state_dict.get("max")
+            if clip_min is not None or clip_max is not None:
+                try:
+                    clip_value = max(abs(float(clip_min or 0.0)), abs(float(clip_max or 0.0)))
+                except Exception:
+                    clip_value = None
+        if clip_value is None and "clip" in state_dict:
+            try:
+                clip_value = abs(float(state_dict["clip"]))
+            except Exception:
+                clip_value = None
+        if clip_value is not None:
+            state_dict["clip"] = clip_value
+        result[canonical_name] = _build_observer(state_dict, cfg, target=canonical_name)
     return result, missing
 
 def wrap_model_for_percentile(
@@ -690,21 +867,22 @@ def wrap_model_for_percentile(
     for module in model.modules():
         for attr in ("weight_quantizer", "act_quantizer"):
             quantizers = _flatten_quantizer_objects(getattr(module, attr, None))
-        for quantizer in quantizers:
-            if not isinstance(quantizer, UniformAffineQuantizer):
-                continue
-            quantizer.mode = "percentile"
-            quantizer.percent = percent
-            quantizer.observered = False
-            quantizer.cached_xmin = None
-            quantizer.cached_xmax = None
-            if hasattr(quantizer, "observer") and quantizer.observer is not None:
-                quantizer.observer.owner = quantizer
-            if hasattr(quantizer, "scale"):
-                quantizer.scale = None
-            if hasattr(quantizer, "round_zero_point"):
-                quantizer.round_zero_point = None
-            quantizer._pending_percentile = True
+            for quantizer in quantizers:
+                if not isinstance(quantizer, UniformAffineQuantizer):
+                    continue
+                quantizer.mode = "percentile"
+                quantizer.percent = percent
+                if hasattr(quantizer, "observered"):
+                    quantizer.observered = False
+                quantizer.cached_xmin = None
+                quantizer.cached_xmax = None
+                if hasattr(quantizer, "observer") and quantizer.observer is not None:
+                    quantizer.observer.owner = quantizer
+                if hasattr(quantizer, "scale"):
+                    quantizer.scale = None
+                if hasattr(quantizer, "round_zero_point"):
+                    quantizer.round_zero_point = None
+                quantizer._pending_percentile = True
     setattr(model, "_quant_pct_fake_wrapped", True)
     return model
 
@@ -726,8 +904,8 @@ def _finalize_pending_percentiles(
                 stats_payload = quantizer.export_percentile_stats()
                 if not isinstance(stats_payload, Mapping):
                     canonical_module = rewrite_percentile_module_path(module_name)
-                    key = _format_quantizer_key(canonical_module, role, idx, total)
-                    logger.warning("[PercentileStats][warn] missing observer for %s", key)
+                    key = canonical_quant_key(canonical_module, attr)
+                    logger.warning("[PercentileStats][warn] missing observer for %s.%s", canonical_module, attr)
                     continue
                 quantizer.apply_percentile_stats(stats_payload)
 
@@ -822,7 +1000,10 @@ def enable(
     fake_quant_bits: Optional[Tuple[int, int]] = None,
     export_per_quant: bool = False,
     amp: Optional[bool] = None,
-) -> None:
+    stats: Optional[Mapping[str, Any]] = None,
+    pct: Optional[float] = None,
+    apply_stats_denylist: Optional[Collection[str]] = None,
+) -> Optional[Dict[str, Any]]:
     """Enable percentile clipping by registering forward hooks on ``model``."""
 
     if targets is not None:
@@ -840,32 +1021,25 @@ def enable(
         else:
             raw_targets = list(cfg_targets)
 
-    normalized_targets = _normalize_targets(raw_targets)
-    setattr(cfg, "targets_normalized", normalized_targets)
+    normalized_targets = list(_normalize_targets(raw_targets))
+    stats_metadata: Dict[str, Any] = {"normalized_targets": list(normalized_targets)}
+    setattr(cfg, "targets_normalized", list(normalized_targets))
     print(f"[QuantPct] Normalized targets: {normalized_targets}")
     if export_per_quant:
         setattr(cfg, "_quant_pct_export_per_quant", True)
     if amp is not None:
         setattr(cfg, "_quant_pct_amp_request", bool(amp))
+    if pct is not None:
+        try:
+            pct_value = float(pct)
+        except Exception:
+            pct_value = None
+        if pct_value is not None:
+            setattr(cfg, "_quant_pct_pct_override", pct_value)
 
-    requested_targets: Sequence[str] = tuple(normalized_targets)
-
-    canonical_requested = tuple(_normalize_target_list(requested_targets))
-    hook_targets_sequence = expand_targets_for_hooks(canonical_requested)
-    hook_targets = tuple(hook_targets_sequence)
-
-    skipped_targets: List[str] = []
-    for name in canonical_requested:
-        canonical = normalize_target_name(name)
-        expanded = tuple(normalize_targets(expand_target_for_hooks(name)))
-        if expanded or has_hook_targets(canonical):
-            continue
-        skipped_targets.append(canonical)
-    if skipped_targets:
-        logger.warning(
-            "[QuantPct] Skipping targets without hook mapping: %s",
-            ", ".join(skipped_targets),
-        )
+    stats_payload_raw: Optional[Mapping[str, Any]] = None
+    stats_payload: Optional[Dict[str, Any]] = None
+    pct_override = getattr(cfg, "_quant_pct_pct_override", None)
 
     normalized_mode = mode.lower()
     if normalized_mode not in {"apply", "collect", "off"}:
@@ -884,30 +1058,73 @@ def enable(
         percent_value = cfg.p_max
         wrap_model_for_percentile(model, fq_bits[0], fq_bits[1], percent_value)
 
+    if normalized_mode == "apply":
+        stats_payload_raw = stats if stats is not None else load_stats(cfg.stats_path)
+        if not isinstance(stats_payload_raw, Mapping):
+            raise TypeError(
+                f"Percentile stats must be a mapping, received {type(stats_payload_raw).__name__}."
+            )
+        stats_payload_raw = dict(stats_payload_raw)
+        stats_payload = normalize_stats_format(dict(stats_payload_raw))
+        normalized_from_stats = stats_payload.get("normalized_targets") or stats_payload_raw.get("normalized_targets")
+        if normalized_from_stats:
+            normalized_targets = list(normalized_from_stats)
+            stats_metadata["normalized_targets"] = list(normalized_targets)
+            setattr(cfg, "targets_normalized", list(normalized_targets))
+
+    requested_targets: Sequence[str] = tuple(normalized_targets)
+    canonical_requested = tuple(_normalize_target_list(requested_targets))
+
+    skipped_targets: List[str] = []
+    for name in canonical_requested:
+        canonical = normalize_target_name(name)
+        expanded = tuple(normalize_targets(expand_target_for_hooks(name)))
+        if expanded or has_hook_targets(canonical):
+            continue
+        skipped_targets.append(canonical)
+    if skipped_targets:
+        logger.warning(
+            "[QuantPct] Skipping targets without hook mapping: %s",
+            ", ".join(skipped_targets),
+        )
+    hook_targets_sequence = expand_targets_for_hooks(canonical_requested)
+    hook_targets = tuple(hook_targets_sequence)
+
     observer_map: Dict[str, PercentileObserver]
     if normalized_mode == "collect":
         observer_map = {}
         handles: List[Any] = []
     else:  # apply
-        stats = load_stats(cfg.stats_path)
-        stats = normalize_stats_format(stats)
-        targets_preview = stats.get("targets", [])
+        if stats_payload is None:
+            stats_payload_raw = load_stats(cfg.stats_path)
+            stats_payload = normalize_stats_format(dict(stats_payload_raw))
+        targets_preview = stats_payload.get("targets", [])
         logger.info(
             "[QuantPct] Loaded stats targets=%d preview=%s",
             len(targets_preview),
             ", ".join(list(targets_preview)[:10]),
         )
-        cfg_from_stats = stats.get("config", {})
+        cfg_from_stats = stats_payload.get("config", {})
         cfg.p_max = cfg_from_stats.get("p_max", cfg.p_max)
         cfg.mode = cfg_from_stats.get("mode", cfg.mode)
         cfg.max_samples = cfg_from_stats.get("max_samples", cfg.max_samples)
 
-        observer_map_all, missing_details = _collect_observers(stats, cfg)
-        percentile_applied = percentile_missing = 0
+        observer_map_all, missing_details = _collect_observers(stats_payload, cfg, pct_override)
         stats_path_value = getattr(cfg, "stats_path", None)
-        if stats_path_value:
+        percentile_applied = percentile_missing = 0
+        if stats_payload_raw is not None:
+            percentile_applied, percentile_missing = _apply_percentile_stats_payload(
+                model,
+                stats_payload_raw,
+                logger,
+                apply_denylist=apply_stats_denylist,
+            )
+        elif stats_path_value:
             percentile_applied, percentile_missing = _load_and_apply_percentile_stats(
-                model, stats_path_value, logger
+                model,
+                stats_path_value,
+                logger,
+                apply_denylist=apply_stats_denylist,
             )
 
         expected_canonical = [normalize_target_name(name) for name in hook_targets]
@@ -928,14 +1145,16 @@ def enable(
         if missing_required:
             stats_source = getattr(cfg, "stats_path", None)
             if strict_missing_stats:
+                known_keys = list(stats_payload.get("observers", {}).keys())
                 details_map = {entry[0]: entry[1:] for entry in missing_details}
                 diagnostic_segments = []
                 for missing_name in missing_required:
                     candidates, available_keys = details_map.get(missing_name, ([], []))
                     candidate_preview = ", ".join(candidates[:8]) if candidates else "<none>"
                     available_preview = ", ".join(available_keys[:12]) if available_keys else "<none>"
+                    nearest = nearest_keys(missing_name, known_keys)
                     diagnostic_segments.append(
-                        f"{missing_name} (candidates={candidate_preview}; available={available_preview})"
+                        f"{missing_name} (candidates={candidate_preview}; available={available_preview}; nearest={nearest})"
                     )
                 detail_msg = "; ".join(diagnostic_segments)
                 raise KeyError(
@@ -971,6 +1190,9 @@ def enable(
         )
     setattr(model, _HANDLE_ATTR, handles)
     setattr(model, _OBSERVER_ATTR, observer_map)
+    if normalized_mode == "collect":
+        return stats_metadata
+    return None
 
 
 def disable(model) -> None:
