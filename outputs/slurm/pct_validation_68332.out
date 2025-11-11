@@ -1,0 +1,82 @@
+[Step 1] Calibration with targets: vision_backbone,llm_backbone,projector
+[QuantConfig] W8A8
+11/11 [13:47:29] INFO     | >> [*] Downloading `cobra+3b from HF Hub  load.py:61
+11/11 [13:47:30] INFO     | >> [*] Found Config =>> Loading &         load.py:73
+                          Freezing cobra+3b with:                               
+                                       Vision Backbone =>>                      
+                          dinosiglip-vit-so-384px                               
+                                       LLM Backbone    =>>                      
+                          mamba-2.8b-zephyr                                     
+                                       Arch Specifier  =>>                      
+                          no-align+fused-gelu-mlp                               
+                                       Checkpoint Path =>>                      
+                          `/work/asdf1234/.cache/huggingface/hub/mode           
+                          ls--han1997--cobra/snapshots/7e3fb02b4f9291           
+                          f6dcc0e9143ada0e5d7239372d/cobra+3b/checkpo           
+                          ints/latest-checkpoint.pt`                            
+                 INFO     | >> [*] Loading Vision Backbone            load.py:82
+                          dinosiglip-vit-so-384px                               
+11/11 [13:47:33] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (timm/vit_large_patch14_reg4_dinov2.lv                
+                          d142m)                                                
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'pytorch_model.bin' (as                               
+                          'model.safetensors'). Loading weights                 
+                          using safetensors.                                    
+                 INFO     | >> Resized position embedding: (37,  pos_embed.py:55
+                          37) to (27, 27).                                      
+11/11 [13:47:37] INFO     | >> Loading pretrained weights from   _builder.py:186
+                          Hugging Face hub                                      
+                          (('timm/ViT-SO400M-14-SigLIP-384',                    
+                          'open_clip_pytorch_model.bin'))                       
+                 INFO     | >>  Safe alternative available for       _hub.py:180
+                          'open_clip_pytorch_model.bin' (as                     
+                          'open_clip_model.safetensors'). Loading               
+                          weights using safetensors.                            
+11/11 [13:47:38] INFO     | >> [*] Loading Pretrained LLM             load.py:89
+                          mamba-2.8b-zephyr via HF Transformers                 
+                 INFO     | >>     |=> Building empty mamba LLM  base_llm.py:129
+                          from `xiuyul/mamba-2.8b-zephyr`                       
+11/11 [13:48:00] INFO     | >>     |=> Loading mamba (Fast)      base_llm.py:151
+                          Tokenizer via the AutoTokenizer API                   
+                 INFO     | >> [*] Loading VLM cobra+3b from          load.py:98
+                          Checkpoint; Freezing Weights 🥶                       
+[QuantPct][Linear] sample module paths: vision_backbone, vision_backbone.dino_featurizer, vision_backbone.dino_featurizer.patch_embed, vision_backbone.dino_featurizer.patch_embed.proj, vision_backbone.dino_featurizer.patch_embed.norm
+11/11 [13:48:23] INFO     | >> [QuantPct][Linear] Replaced 469  quant_pct.py:466
+                          module(s):                                            
+                          vision_backbone.dino_featurizer.block                 
+                          s.0.attn.qkv,                                         
+                          vision_backbone.dino_featurizer.block                 
+                          s.0.attn.proj,                                        
+                          vision_backbone.dino_featurizer.block                 
+                          s.0.mlp.fc1,                                          
+                          vision_backbone.dino_featurizer.block                 
+                          s.0.mlp.fc2,                                          
+                          vision_backbone.dino_featurizer.block                 
+                          s.1.attn.qkv,                                         
+                          vision_backbone.dino_featurizer.block                 
+                          s.1.attn.proj,                                        
+                          vision_backbone.dino_featurizer.block                 
+                          s.1.mlp.fc1,                                          
+                          vision_backbone.dino_featurizer.block                 
+                          s.1.mlp.fc2,                                          
+                          vision_backbone.dino_featurizer.block                 
+                          s.2.attn.qkv,                                         
+                          vision_backbone.dino_featurizer.block                 
+                          s.2.attn.proj                                         
+[QuantPct][Conv] sample module paths: vision_backbone, vision_backbone.dino_featurizer, vision_backbone.dino_featurizer.patch_embed, vision_backbone.dino_featurizer.patch_embed.proj, vision_backbone.dino_featurizer.patch_embed.norm
+                 INFO     | >> [QuantPct][Conv] Replaced 2      quant_pct.py:466
+                          module(s):                                            
+                          vision_backbone.dino_featurizer.patch                 
+                          _embed.proj,                                          
+                          vision_backbone.siglip_featurizer.pat                 
+                          ch_embed.proj                                         
+[QuantPct][MatMul] sample module paths: vision_backbone, vision_backbone.dino_featurizer, vision_backbone.dino_featurizer.patch_embed, vision_backbone.dino_featurizer.patch_embed.norm, vision_backbone.dino_featurizer.pos_drop
+                 INFO     | >> [QuantPct][MatMul] Replaced 0   quant_pct.py:1592
+                          module(s)                                             
+                 INFO     | >> [MatMulQuant] Skipped           quant_pct.py:1596
+                          (attention uses Linear path)                          
+[Warning] No quantizers found. Per-quantizer export will be empty.
+[Debug][Quantizer] before-calib: weight=0 act=0 total=0
+[Calib] num_batches=13

@@ -74,7 +74,7 @@ __all__ = [
     "activate_observers",
     "finalize_quant_params",
     "wrap_model_for_percentile",
-    "rewrite_percentile_module_path",
+"rewrite_percentile_module_path",
 ]
 
 _HANDLE_ATTR = "_quant_pct_handles"
@@ -83,6 +83,80 @@ _OBSERVER_ATTR = "_quant_pct_observers"
 ActivationCallback = Callable[[str, str, object], None]
 
 DEFAULT_TARGETS: Sequence[str] = tuple(DEFAULT_PERCENTILE_TARGETS)
+
+_DEFAULT_NORMALIZED_ORDER: Tuple[str, ...] = (
+    "vision_backbone.dino",
+    "vision_backbone.siglip",
+    "llm_backbone",
+    "projector",
+)
+
+_CANONICAL: Set[str] = {
+    "vision_backbone",
+    *_DEFAULT_NORMALIZED_ORDER,
+}
+
+_ALIAS_MAP: Dict[str, Tuple[str, ...]] = {
+    "vision": ("vision_backbone",),
+    "vb": ("vision_backbone",),
+    "dino": ("vision_backbone.dino",),
+    "siglip": ("vision_backbone.siglip",),
+    "llm": ("llm_backbone",),
+    "mm": ("projector",),
+    "projector.out": ("projector",),
+}
+
+
+def _normalize_targets(raw: Iterable[str]) -> List[str]:
+    out: Set[str] = set()
+    unknown: Set[str] = set()
+
+    def _resolve(token: str) -> None:
+        queue: List[str] = [token]
+        seen: Set[str] = set()
+        while queue:
+            key = (queue.pop() or "").strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            if key == "vision_backbone":
+                out.update(("vision_backbone.dino", "vision_backbone.siglip"))
+                continue
+            if key in _ALIAS_MAP:
+                queue.extend(_ALIAS_MAP[key])
+                continue
+            if key.startswith("vision_backbone."):
+                out.add(key)
+                continue
+            if key in _CANONICAL:
+                out.add(key)
+                continue
+            unknown.add(key)
+
+    for entry in raw:
+        text = (entry or "").strip()
+        if not text:
+            continue
+        parts = [p.strip() for p in text.split(",")] if "," in text else [text]
+        for part in parts:
+            if not part:
+                continue
+            _resolve(part)
+
+    if not out:
+        out.update(_DEFAULT_NORMALIZED_ORDER)
+
+    ordered = [name for name in _DEFAULT_NORMALIZED_ORDER if name in out]
+    extras = sorted(out.difference(_DEFAULT_NORMALIZED_ORDER))
+    ordered.extend(extras)
+    if unknown:
+        logging.warning(
+            "[QuantPct] Ignoring unknown percentile target(s): %s",
+            ", ".join(sorted(unknown)),
+        )
+    return ordered
+
+
 LEGACY_TARGET_MAP: Dict[str, str] = {
     # Early keys
     "vision.dino": "vision_backbone.dino_featurizer",
@@ -212,17 +286,106 @@ def _iter_percentile_quantizers(module: nn.Module, attr: str) -> List[UniformAff
     ]
 
 
+def _replace_module(root: nn.Module, path: str, new_module: nn.Module) -> None:
+    if not path:
+        raise ValueError("Cannot replace the root module.")
+    parts = path.split(".")
+    parent = root
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    setattr(parent, parts[-1], new_module)
+
+
+def _iter_named_modules_flex(model: nn.Module) -> Iterator[Tuple[str, nn.Module]]:
+    """Yield `(qualified_name, module)` whether named_modules returns pairs or triplets."""
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return
+    for entry in named_modules():
+        if not isinstance(entry, (list, tuple)):
+            continue
+        if len(entry) == 2:
+            name, mod = entry
+            yield name, mod
+        elif len(entry) == 3:
+            parent, name, mod = entry
+            qualified = f"{parent}.{name}" if parent else name
+            yield qualified, mod
+        else:
+            continue
+
+
 def _safe_named_modules(model: nn.Module) -> Iterable[Tuple[str, nn.Module]]:
     """Yield (name, module) even if named_modules returns extra metadata."""
-    for entry in model.named_modules():
-        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-            yield entry[0], entry[1]
+    yield from _iter_named_modules_flex(model)
+
+
+def iter_percentile_quantizers(
+    model: nn.Module,
+) -> Iterable[Tuple[str, str, UniformAffineQuantizer]]:
+    """Yield `(path, role, quantizer)` for every percentile-mode quantizer."""
+    for module_name, module in _safe_named_modules(model):
+        if not module_name:
             continue
-        try:
-            name, module = entry  # type: ignore[misc]
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            raise ValueError(f"Unsupported named_modules() entry: {entry!r}") from exc
-        yield name, module
+        weight_quant = getattr(module, "weight_quantizer", None)
+        if isinstance(weight_quant, UniformAffineQuantizer) and str(
+            getattr(weight_quant, "mode", "")
+        ).lower() == "percentile":
+            yield module_name, "weight", weight_quant
+        act_quant = getattr(module, "act_quantizer", None)
+        if isinstance(act_quant, UniformAffineQuantizer) and str(
+            getattr(act_quant, "mode", "")
+        ).lower() == "percentile":
+            yield module_name, "act", act_quant
+
+
+def count_percentile_quantizers(model: nn.Module) -> Tuple[int, int]:
+    weight = 0
+    act = 0
+    samples: List[Tuple[str, str, Any]] = []
+    for path, role, quant in iter_percentile_quantizers(model):
+        if len(samples) < 5:
+            samples.append((path, role, getattr(quant, "mode", None)))
+        if role == "weight":
+            weight += 1
+        else:
+            act += 1
+    print(f"[Debug][Quantizer][samples]={samples}")
+    return weight, act
+
+
+def export_percentile_quantizers(
+    model: nn.Module,
+    stats_path: Optional[str | Path] = None,
+) -> Tuple[int, OrderedDict[str, Dict[str, Any]]]:
+    entries: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+    exported = 0
+    for module_name, role, quant in iter_percentile_quantizers(model):
+        exporter = getattr(quant, "export_percentile_stats", None)
+        if not callable(exporter):
+            continue
+        payload = exporter()
+        if not payload:
+            continue
+        rewritten = rewrite_percentile_module_path(module_name)
+        key = f"{rewritten}.{role}_quantizer"
+        entries[key] = dict(payload)
+        exported += 1
+
+    if stats_path:
+        resolved = Path(stats_path).expanduser()
+        if resolved.exists():
+            existing = torch.load(resolved, map_location="cpu")
+            if not isinstance(existing, dict):
+                raise TypeError(f"Percentile stats at {resolved} must be a mapping.")
+            base: Dict[str, Any] = dict(existing)
+        else:
+            base = {}
+        base.update(entries)
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(base, resolved)
+
+    return exported, entries
 
 
 def _load_and_apply_percentile_stats(model: nn.Module, path: str, logger: logging.Logger) -> Tuple[int, int]:
@@ -569,6 +732,84 @@ def _finalize_pending_percentiles(
                 quantizer.apply_percentile_stats(stats_payload)
 
 
+def _configure_quantizer_percentile(
+    quantizer: Optional[UniformAffineQuantizer],
+    percent: float,
+) -> None:
+    if quantizer is None:
+        return
+    quantizer.mode = "percentile"
+    quantizer.percent = float(percent)
+    quantizer.cached_xmin = None
+    quantizer.cached_xmax = None
+    quantizer.scale = None
+    quantizer.round_zero_point = None
+    quantizer._pending_percentile = True  # type: ignore[attr-defined]
+    if hasattr(quantizer, "observer"):
+        observer = getattr(quantizer, "observer")
+        if observer is not None:
+            observer.owner = quantizer  # type: ignore[attr-defined]
+    if hasattr(quantizer, "observered"):
+        quantizer.observered = False
+
+
+def _wrap_for_collect(model: nn.Module, cfg: QuantConfig) -> None:
+    from torch import nn as torch_nn
+
+    percent = float(getattr(cfg, "p_max", 0.999))
+    weight_bits = int(getattr(cfg, "weight_bits", 8))
+    act_bits = int(getattr(cfg, "act_bits", 8))
+
+    def _prepare_quantizer_container(module: nn.Module) -> None:
+        _configure_quantizer_percentile(getattr(module, "weight_quantizer", None), percent)
+        _configure_quantizer_percentile(getattr(module, "act_quantizer", None), percent)
+        setattr(module, "_quant_pct_collect_wrapped", True)
+
+    for name, module in list(_iter_named_modules_flex(model)):
+        if not name:
+            continue
+        if getattr(module, "_quant_pct_collect_wrapped", False):
+            continue
+        if isinstance(module, QuantLinear):
+            _prepare_quantizer_container(module)
+            continue
+        if isinstance(module, QuantConv2d):
+            _prepare_quantizer_container(module)
+            continue
+        if isinstance(module, torch_nn.Linear):
+            quant_layer = QuantLinear(
+                module,
+                observe="percentile",
+                weight_bits=weight_bits,
+                act_bits=act_bits,
+            )
+            _prepare_quantizer_container(quant_layer)
+            _replace_module(model, name, quant_layer)
+            continue
+        if isinstance(module, torch_nn.Conv2d):
+            weight_params = {
+                "dynamic_method": "per_tensor",
+                "n_bits": weight_bits,
+                "shape": module.weight.shape,
+                "is_weight": True,
+                "observe": "percentile",
+            }
+            act_params = {
+                "dynamic_method": "per_tensor",
+                "n_bits": act_bits,
+                "has_batch_dim": True,
+                "observe": "percentile",
+            }
+            quant_layer = QuantConv2d(
+                module,
+                weight_quant_params=weight_params,
+                act_quant_params=act_params,
+                observe="percentile",
+            )
+            _prepare_quantizer_container(quant_layer)
+            _replace_module(model, name, quant_layer)
+
+
 def enable(
     model,
     cfg: QuantConfig,
@@ -579,15 +820,35 @@ def enable(
     strict_missing_stats: bool = False,
     wrap_fake_quant: bool = False,
     fake_quant_bits: Optional[Tuple[int, int]] = None,
+    export_per_quant: bool = False,
+    amp: Optional[bool] = None,
 ) -> None:
     """Enable percentile clipping by registering forward hooks on ``model``."""
 
     if targets is not None:
-        requested_targets: Sequence[str] = tuple(targets)
-    elif cfg.targets:
-        requested_targets = tuple(cfg.targets)
+        raw_targets: Iterable[str]
+        if isinstance(targets, str):
+            raw_targets = [targets]
+        else:
+            raw_targets = list(targets)
     else:
-        requested_targets = tuple(DEFAULT_PERCENTILE_TARGETS)
+        cfg_targets = getattr(cfg, "targets", None)
+        if cfg_targets is None:
+            raw_targets = []
+        elif isinstance(cfg_targets, str):
+            raw_targets = [cfg_targets]
+        else:
+            raw_targets = list(cfg_targets)
+
+    normalized_targets = _normalize_targets(raw_targets)
+    setattr(cfg, "targets_normalized", normalized_targets)
+    print(f"[QuantPct] Normalized targets: {normalized_targets}")
+    if export_per_quant:
+        setattr(cfg, "_quant_pct_export_per_quant", True)
+    if amp is not None:
+        setattr(cfg, "_quant_pct_amp_request", bool(amp))
+
+    requested_targets: Sequence[str] = tuple(normalized_targets)
 
     canonical_requested = tuple(_normalize_target_list(requested_targets))
     hook_targets_sequence = expand_targets_for_hooks(canonical_requested)
@@ -616,26 +877,17 @@ def enable(
 
     disable(model)
 
-    if wrap_fake_quant:
+    if normalized_mode == "collect":
+        _wrap_for_collect(model, cfg)
+    elif wrap_fake_quant:
         fq_bits = fake_quant_bits or (cfg.weight_bits, cfg.act_bits)
         percent_value = cfg.p_max
         wrap_model_for_percentile(model, fq_bits[0], fq_bits[1], percent_value)
 
     observer_map: Dict[str, PercentileObserver]
     if normalized_mode == "collect":
-        observer_map = {
-            name: PercentileObserver(
-                cfg.p_max, cfg.mode, cfg.max_samples, target=normalize_target_name(name)
-            )
-            for name in hook_targets
-        }
-        handles = attach_percentile_hooks(
-            model,
-            observers=observer_map,
-            apply_clipping=False,
-            targets=hook_targets,
-            dumper=dumper,
-        )
+        observer_map = {}
+        handles: List[Any] = []
     else:  # apply
         stats = load_stats(cfg.stats_path)
         stats = normalize_stats_format(stats)
