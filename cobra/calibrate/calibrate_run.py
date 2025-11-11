@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from argparse import BooleanOptionalAction
 import contextlib
 import glob
 import logging
@@ -71,6 +72,18 @@ if hasattr(quant_pct, "rewrite_percentile_module_path"):
 else:
     def _rewrite_module_path(path: str) -> str:
         return path
+
+
+if hasattr(quant_pct, "canonical_quant_key"):
+    _canonical_quant_key = quant_pct.canonical_quant_key
+else:
+    def _canonical_quant_key(module_path: str, role: str) -> str:
+        role_token = role
+        if role_token not in ("weight_quantizer", "act_quantizer"):
+            role_lower = str(role_token).lower()
+            role_token = "weight_quantizer" if role_lower.startswith("weight") else "act_quantizer"
+        cleaned = module_path.strip(".")
+        return f"{cleaned}.{role_token}"
 
 
 def _discover_images(root: Path) -> List[Path]:
@@ -149,15 +162,6 @@ def _tensor_to_python(value: torch.Tensor) -> Any:
     return tensor.reshape(-1).tolist()
 
 
-def _format_quantizer_key(module_name: str, role: str, index: int, total: int) -> str:
-    role_token = "weight" if role.startswith("weight") else "act"
-    if total <= 0:
-        raise ValueError("`total` must be positive when formatting quantizer keys.")
-    if index < 0 or index >= total:
-        raise IndexError(f"Quantizer index {index} out of range for total={total}.")
-    return f"{module_name}.{role_token}_quantizer.{index}"
-
-
 def _safe_named_modules(model: nn.Module):
     """Yield (name, module) even if ``named_modules`` returns extra metadata."""
     for entry in model.named_modules():
@@ -186,33 +190,34 @@ def _collect_percentile_quantizer_stats(
             continue
         rewritten = _rewrite_module_path(name)
         for role, attr in (("weight", "weight_quantizer"), ("act", "act_quantizer")):
-            quantizers = _iter_uniform_quantizers(getattr(module, attr, None))
+            quantizers = [
+                quant
+                for quant in _iter_uniform_quantizers(getattr(module, attr, None))
+                if str(getattr(quant, "mode", "")).lower() == "percentile"
+            ]
             if not quantizers:
                 continue
-            total = len(quantizers)
-            for idx, quant in enumerate(quantizers):
-                if str(getattr(quant, "mode", "")).lower() != "percentile":
-                    continue
-                key = _format_quantizer_key(rewritten, role, idx, total)
-                pending = bool(getattr(quant, "_pending_percentile", False))
-                if pending:
-                    message = f"[PercentileStats][warn] Pending observer for {key}; skipping entry."
-                    if strict_missing_observer:
-                        raise RuntimeError(message.replace("[PercentileStats][warn] ", ""))
-                    print(message)
-                    continue
-                exporter = getattr(quant, "export_percentile_stats", None)
-                if not callable(exporter):
-                    continue
-                payload = exporter()
-                if not payload:
-                    message = f"[PercentileStats][warn] Missing export payload for {key}; skipping entry."
-                    if strict_missing_observer:
-                        raise RuntimeError(message.replace("[PercentileStats][warn] ", ""))
-                    print(message)
-                    continue
-                stats[key] = dict(payload)
-                total_entries += 1
+            key = _canonical_quant_key(rewritten, attr)
+            quant = quantizers[0]
+            pending = bool(getattr(quant, "_pending_percentile", False))
+            if pending:
+                message = f"[PercentileStats][warn] Pending observer for {key}; skipping entry."
+                if strict_missing_observer:
+                    raise RuntimeError(message.replace("[PercentileStats][warn] ", ""))
+                print(message)
+                continue
+            exporter = getattr(quant, "export_percentile_stats", None)
+            if not callable(exporter):
+                continue
+            payload = exporter()
+            if not payload:
+                message = f"[PercentileStats][warn] Missing export payload for {key}; skipping entry."
+                if strict_missing_observer:
+                    raise RuntimeError(message.replace("[PercentileStats][warn] ", ""))
+                print(message)
+                continue
+            stats[key] = dict(payload)
+            total_entries += 1
     return stats, total_entries
 
 
@@ -240,34 +245,6 @@ def _count_quantizers(model: nn.Module) -> Tuple[int, int, int]:
             total += 1
     return weight_count, act_count, total
 
-
-def _build_target_stats(stats: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    observers = stats.get("observers", {})
-    export: Dict[str, Dict[str, Any]] = {}
-    for target, state in observers.items():
-        clip = state.get("clip")
-        if clip is None:
-            continue
-        clip_tensor = torch.as_tensor(clip, dtype=torch.float32)
-        canonical = normalize_target_name(target)
-        entry: Dict[str, Any] = {
-            "mode": "percentile",
-            "percent": float(state.get("p_max", 0.0)),
-            "numel": int(state.get("numel", 0)),
-            "target": canonical,
-        }
-        for hook_target in expand_target_for_hooks(canonical):
-            module_path = DEFAULT_PERCENTILE_TARGET_MAP.get(hook_target)
-            if module_path is not None:
-                entry["module"] = _rewrite_module_path(module_path)
-                break
-        percent_value = entry["percent"]
-        percent_key = f"p{percent_value:.6g}" if percent_value else "clip"
-        entry[percent_key] = _tensor_to_python(clip_tensor)
-        entry["min"] = _tensor_to_python(-clip_tensor)
-        entry["max"] = _tensor_to_python(clip_tensor)
-        export[f"target::{canonical}"] = entry
-    return export
 
 
 def parse_args() -> argparse.Namespace:
@@ -300,9 +277,20 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to export percentile statistics for downstream application.",
     )
     parser.add_argument(
+        "--mode",
+        choices=("collect", "apply", "real-quant"),
+        default="collect",
+        help="Select collect/apply/real-quant workflow (default: collect).",
+    )
+    parser.add_argument(
+        "--stats-in",
+        default=None,
+        help="Path to percentile_stats.pt when running in apply/real-quant mode.",
+    )
+    parser.add_argument(
         "--wrap-fake-quant",
         default=True,
-        action=argparse.BooleanOptionalAction,
+        action=BooleanOptionalAction,
         help="Wrap model with percentile-ready fake quant layers before calibration (default: enabled).",
     )
     parser.add_argument(
@@ -325,15 +313,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-amp-during-calib",
-        action="store_true",
+        action=BooleanOptionalAction,
         default=True,
-        help="Disable autocast during calibration collection (default: enabled).",
+        help=(
+            "Disable autocast during calibration collection (default: True). "
+            "Use --amp-during-calib to enable."
+        ),
     )
     parser.add_argument(
         "--clean-old-stats",
         action="store_true",
         default=False,
         help="Remove outputs/percentile_* directories before running calibration.",
+    )
+    parser.add_argument(
+        "--pct",
+        type=float,
+        default=None,
+        help="Override percentile for clipping (e.g., 99.9).",
+    )
+    parser.add_argument(
+        "--strict-missing-stats",
+        action=BooleanOptionalAction,
+        default=True,
+        help=(
+            "Fail when percentile stats are missing required entries (default: True). "
+            "Use --no-strict-missing-stats to relax."
+        ),
     )
     return parser.parse_args()
 
@@ -423,6 +429,7 @@ def _emit_mem_peak(args, cfg, start_time: float) -> None:
 
 def main() -> None:
     args = parse_args()
+    setattr(args, "mode", args.mode)
     if args.clean_old_stats:
         import shutil
 
@@ -436,13 +443,21 @@ def main() -> None:
         cfg.weight_bits = int(args.weight_bits)
     if args.act_bits is not None:
         cfg.act_bits = int(args.act_bits)
-    if args.force_percentile is not None:
-        cfg.p_max = float(args.force_percentile)
-        print(f"[QuantConfig] forcing percentile to {cfg.p_max}")
     print(f"[QuantConfig] W{cfg.weight_bits}A{cfg.act_bits}")
     stats_destination = args.stats_out or getattr(cfg, "stats_path", None)
     if stats_destination:
         cfg.stats_path = stats_destination
+
+    pct_override: Optional[float] = None
+    if args.pct is not None:
+        pct_override = float(args.pct)
+    elif args.force_percentile is not None:
+        pct_override = float(args.force_percentile)
+    if pct_override is not None:
+        cfg.p_max = pct_override
+    current_pct = getattr(cfg, "p_max", None)
+    effective_pct = current_pct if current_pct is not None else "auto-policy"
+    print(f"[QuantPct] effective percentile = {effective_pct}")
 
     user_targets = _parse_targets(args.targets)
     if user_targets is not None:
@@ -470,222 +485,327 @@ def main() -> None:
         f"[Debug][Quantizer] before-calib: weight={weight_q_before} act={act_q_before} total={total_q_before}"
     )
 
-    transform = model.vision_backbone.image_transform
-    limit = None
-    if cfg.num_batches is not None:
-        limit = cfg.batch_size * cfg.num_batches
-    dataset = CalibrationDataset(Path(args.data), transform, limit=limit)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=_collate,
-    )
-    try:
-        num_batches = len(dataloader)
-    except TypeError:
-        num_batches = None
-    if num_batches is None:
-        print("[Calib] num_batches=unknown (non-sized dataloader)")
-    else:
-        print(f"[Calib] num_batches={num_batches}")
-        if num_batches == 0:
-            raise RuntimeError("[fatal] No calibration batches. Increase --num-batches or provide data.")
+    if not args.strict_missing_stats:
+        print("[Warning] --strict-missing-stats disabled; some layers may run unquantized.")
 
-    enable_kwargs: Dict[str, Any] = {"mode": "collect", "export_per_quant": True}
-    if args.no_amp_during_calib:
-        enable_kwargs["amp"] = False
-    if user_targets is not None:
-        enable_kwargs["targets"] = tuple(user_targets)
-    elif getattr(cfg, "targets", None):
-        enable_kwargs["targets"] = getattr(cfg, "targets")
+    is_collect_mode = args.mode == "collect"
 
-    fw_counter = {"value": 0}
+    if is_collect_mode:
+        transform = model.vision_backbone.image_transform
+        limit = None
+        if cfg.num_batches is not None:
+            limit = cfg.batch_size * cfg.num_batches
+        dataset = CalibrationDataset(Path(args.data), transform, limit=limit)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=(device.type == "cuda"),
+            collate_fn=_collate,
+        )
+        try:
+            num_batches = len(dataloader)
+        except TypeError:
+            num_batches = None
+        if num_batches is None:
+            print("[Calib] num_batches=unknown (non-sized dataloader)")
+        else:
+            print(f"[Calib] num_batches={num_batches}")
+            if num_batches == 0:
+                raise RuntimeError("[fatal] No calibration batches. Increase --num-batches or provide data.")
 
-    def _count_forward(_module, _inputs):
-        fw_counter["value"] += 1
+        enable_kwargs: Dict[str, Any] = {
+            "mode": "collect",
+            "export_per_quant": True,
+            "pct": pct_override,
+            "strict_missing_stats": args.strict_missing_stats,
+        }
+        if args.no_amp_during_calib:
+            enable_kwargs["amp"] = False
+        if user_targets is not None:
+            enable_kwargs["targets"] = tuple(user_targets)
+        elif getattr(cfg, "targets", None):
+            enable_kwargs["targets"] = getattr(cfg, "targets")
 
-    forward_hook = model.register_forward_pre_hook(_count_forward)
-    quant_hooks_enabled = False
-    targets_norm: Optional[Sequence[str]] = None
-    try:
-        quant_pct.enable(model, cfg, **enable_kwargs)
-        quant_hooks_enabled = True
-        targets_norm = getattr(cfg, "targets_normalized", None) or enable_kwargs.get("targets")
-        print(f"[Run] Using normalized targets: {targets_norm}")
-        qlin_count, qconv_count = _count_quant_wrappers(model)
-        print(f"[PostWrap] QuantLinear={qlin_count} QuantConv2d={qconv_count}")
-        if (qlin_count + qconv_count) == 0:
-            raise RuntimeError(
-                "[QuantPct][fatal] No quant wrappers found after enable(). "
-                "Check include/exclude patterns, ensure AMP/inference_mode is disabled during calibration, "
-                "and that data flows through projector and llm_backbone."
+        fw_counter = {"value": 0}
+
+        def _count_forward(_module, _inputs):
+            fw_counter["value"] += 1
+
+        forward_hook = model.register_forward_pre_hook(_count_forward)
+        quant_hooks_enabled = False
+        targets_norm: Optional[Sequence[str]] = None
+        enable_metadata: Optional[Mapping[str, Any]] = None
+        try:
+            enable_metadata = quant_pct.enable(
+                model,
+                cfg,
+                **enable_kwargs,
             )
-        count_fn = getattr(quant_pct, "count_percentile_quantizers", None)
-        if not callable(count_fn):
-            count_fn = _count_percentile_quantizers_local
-        weight_pre, act_pre = count_fn(model)
-        print(f"[Debug][Quantizer] pre-forward: weight={weight_pre} act={act_pre} total={weight_pre + act_pre}")
-        warmup_batch: Optional[Dict[str, Any]] = None
-        try:
-            warmup_batch = next(iter(dataloader))
-        except StopIteration:
-            warmup_batch = None
-        if warmup_batch is not None:
-            pixel_values = warmup_batch.get("pixel_values")
-            if pixel_values is None:
-                raise KeyError("[Warmup] Batch is missing `pixel_values`.")
-            pixel_values = _move_to_device(pixel_values, device)
-            pixel_values = _cast_float_payload(pixel_values, dtype)
-            text_inputs = _extract_text_inputs(warmup_batch, model, cfg, device, pixel_values)
-            with torch.no_grad():
-                model(
-                    input_ids=text_inputs.get("input_ids"),
-                    attention_mask=text_inputs.get("attention_mask"),
-                    pixel_values=pixel_values,
-                    use_cache=False,
+            quant_hooks_enabled = True
+            targets_norm = getattr(cfg, "targets_normalized", None) or enable_kwargs.get("targets")
+            print(f"[Run] Using normalized targets: {targets_norm}")
+            qlin_count, qconv_count = _count_quant_wrappers(model)
+            print(f"[PostWrap] QuantLinear={qlin_count} QuantConv2d={qconv_count}")
+            if (qlin_count + qconv_count) == 0:
+                raise RuntimeError(
+                    "[QuantPct][fatal] No quant wrappers found after enable(). "
+                    "Check include/exclude patterns, ensure AMP/inference_mode is disabled during calibration, "
+                    "and that data flows through projector and llm_backbone."
                 )
-            print("[Warmup] ran 1 batch for observers")
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(torch.no_grad())
-            if hasattr(torch, "inference_mode"):
-                stack.enter_context(torch.inference_mode(False))
-            if args.no_amp_during_calib and hasattr(torch, "autocast") and device.type in {"cuda", "cpu"}:
-                stack.enter_context(torch.autocast(device_type=device.type, enabled=False))
-            stats = calibrate_model(model, dataloader, cfg, targets=targets_norm)
-    finally:
-        forward_hook.remove()
-        if quant_hooks_enabled:
-            finalize_fn = getattr(quant_pct, "_finalize_pending_percentiles", None)
-            if callable(finalize_fn):
-                finalize_logger = getattr(quant_pct, "logger", None)
-                if finalize_logger is None:
-                    finalize_logger = logging.getLogger("cobra.switches.quant_pct")
+            count_fn = getattr(quant_pct, "count_percentile_quantizers", None)
+            if not callable(count_fn):
+                count_fn = _count_percentile_quantizers_local
+            weight_pre, act_pre = count_fn(model)
+            print(
+                f"[Debug][Quantizer] pre-forward: weight={weight_pre} act={act_pre} total={weight_pre + act_pre}"
+            )
+            stats: Dict[str, Any] = {}
+            if args.mode == "collect":
+                warmup_batch: Optional[Dict[str, Any]] = None
                 try:
-                    finalize_fn(model, finalize_logger)
-                except Exception as finalize_exc:
-                    print(f"[PercentileStats][warn] finalize failed: {finalize_exc}")
-            quant_pct.disable(model)
-    if fw_counter["value"] == 0:
-        print("[warn] forward not executed. quantizers likely remain pending.")
-    weight_q_after, act_q_after, total_q_after = _count_quantizers(model)
-    print(
-        f"[Debug][Quantizer] before-export: weight={weight_q_after} act={act_q_after} total={total_q_after}"
-    )
-
-    strict_missing = bool(args.strict_missing_observer)
-    quantizer_payload: OrderedDict[str, Dict[str, Any]] = OrderedDict()
-    quantizer_export_count: int = 0
-    export_fn = getattr(quant_pct, "export_percentile_quantizers", None)
-    export_target = args.stats_out or getattr(cfg, "stats_path", None)
-    if callable(export_fn):
-        export_result = export_fn(model, export_target)
-        if isinstance(export_result, tuple) and len(export_result) == 2:
-            quantizer_export_count = int(export_result[0])
-            maybe_payload = export_result[1]
-            if isinstance(maybe_payload, Mapping):
-                quantizer_payload = OrderedDict(maybe_payload)
-        elif isinstance(export_result, Mapping):
-            quantizer_payload = OrderedDict(export_result)
-            quantizer_export_count = len(quantizer_payload)
-        elif isinstance(export_result, int):
-            quantizer_export_count = export_result
-    if not quantizer_payload:
-        quantizer_payload, collected_count = _collect_percentile_quantizer_stats(
-            model, strict_missing_observer=strict_missing
+                    warmup_batch = next(iter(dataloader))
+                except StopIteration:
+                    warmup_batch = None
+                if warmup_batch is not None:
+                    pixel_values = warmup_batch.get("pixel_values")
+                    if pixel_values is None:
+                        raise KeyError("[Warmup] Batch is missing `pixel_values`.")
+                    pixel_values = _move_to_device(pixel_values, device)
+                    pixel_values = _cast_float_payload(pixel_values, dtype)
+                    text_inputs = _extract_text_inputs(warmup_batch, model, cfg, device, pixel_values)
+                    with torch.no_grad():
+                        model(
+                            input_ids=text_inputs.get("input_ids"),
+                            attention_mask=text_inputs.get("attention_mask"),
+                            pixel_values=pixel_values,
+                            use_cache=False,
+                        )
+                    print("[Warmup] ran 1 batch for observers")
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(torch.no_grad())
+                    if hasattr(torch, "inference_mode"):
+                        stack.enter_context(torch.inference_mode(False))
+                    if args.no_amp_during_calib and hasattr(torch, "autocast") and device.type in {"cuda", "cpu"}:
+                        stack.enter_context(torch.autocast(device_type=device.type, enabled=False))
+                    stats = calibrate_model(model, dataloader, cfg, targets=targets_norm)
+                    if enable_metadata:
+                        normalized_meta = enable_metadata.get("normalized_targets")
+                    else:
+                        normalized_meta = None
+                    if normalized_meta:
+                        stats["normalized_targets"] = list(normalized_meta)
+                    elif "normalized_targets" not in stats:
+                        cfg_norm = getattr(cfg, "targets_normalized", None)
+                        if cfg_norm:
+                            stats["normalized_targets"] = list(cfg_norm)
+        finally:
+            forward_hook.remove()
+            if quant_hooks_enabled:
+                finalize_fn = getattr(quant_pct, "_finalize_pending_percentiles", None)
+                if callable(finalize_fn):
+                    finalize_logger = getattr(quant_pct, "logger", None)
+                    if finalize_logger is None:
+                        finalize_logger = logging.getLogger("cobra.switches.quant_pct")
+                    try:
+                        finalize_fn(model, finalize_logger)
+                    except Exception as finalize_exc:
+                        print(f"[PercentileStats][warn] finalize failed: {finalize_exc}")
+                quant_pct.disable(model)
+        if fw_counter["value"] == 0:
+            print("[warn] forward not executed. quantizers likely remain pending.")
+        weight_q_after, act_q_after, total_q_after = _count_quantizers(model)
+        print(
+            f"[Debug][Quantizer] before-export: weight={weight_q_after} act={act_q_after} total={total_q_after}"
         )
-        if quantizer_export_count == 0:
-            quantizer_export_count = collected_count
-    print(f"[PercentileStats] per-quantizer exported={quantizer_export_count}")
-    if quantizer_export_count == 0:
-        raise RuntimeError("[PostCheck] per-quantizer export empty")
 
-    if args.stats_out:
-        export_payload = OrderedDict()
-        export_payload["config"] = cfg.to_dict()
-        export_payload["targets"] = normalize_targets(stats.get("targets") or [])
-        export_payload["observers"] = stats.get("observers", {})
-        sample_limit = max(0, int(args.export_quantizer_sample or 0))
-        if sample_limit and quantizer_payload:
-            print(f"[QuantizerSample] previewing first {min(sample_limit, len(quantizer_payload))} entries:")
-            for idx, (key, payload) in enumerate(quantizer_payload.items()):
-                if idx >= sample_limit:
-                    break
-                clip_max = payload.get("clip_max")
-                if clip_max is None:
-                    clip_max = payload.get("clip")
-                print(f"  - {key}: clip_max={clip_max}")
-        export_payload.update(quantizer_payload)
-        output_path = Path(args.stats_out).expanduser()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(export_payload, output_path)
-        if quantizer_export_count > 0:
-            print(f"[PercentileStats] Exported {quantizer_export_count} quantizer entries to `{args.stats_out}`.")
+        strict_missing = bool(args.strict_missing_observer)
+        quantizer_payload: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        quantizer_export_count: int = 0
+        export_fn = getattr(quant_pct, "export_percentile_quantizers", None)
+        export_target = args.stats_out or getattr(cfg, "stats_path", None)
+        if callable(export_fn):
+            export_result = export_fn(model, export_target)
+            if isinstance(export_result, tuple) and len(export_result) == 2:
+                quantizer_export_count = int(export_result[0])
+                maybe_payload = export_result[1]
+                if isinstance(maybe_payload, Mapping):
+                    quantizer_payload = OrderedDict(maybe_payload)
+            elif isinstance(export_result, Mapping):
+                quantizer_payload = OrderedDict(export_result)
+            else:
+                quantizer_export_count = int(export_result or 0)
         else:
-            print(f"[PercentileStats][warn] No percentile quantizer entries exported to `{args.stats_out}`.")
+            stats_payload, quantizer_export_count = _collect_percentile_quantizer_stats(
+                model,
+                strict_missing_observer=strict_missing,
+            )
+            quantizer_payload = stats_payload
 
-    export_root = getattr(cfg, "output_dir", None)
-    if not export_root:
+        print(f"[PercentileStats] per-quantizer exported={quantizer_export_count}")
+        summary = quant_pct.build_stats_summary(stats, per_quantizer_entries=quantizer_export_count)
+        print(
+            "[Summary] observers_hit={observed_layers} per_quant_entries={per_quantizer_entries} samples={samples}".format(
+                **summary
+            )
+        )
+        if summary["per_quantizer_entries"] == 0:
+            raise RuntimeError("[PostCheck] per-quantizer export empty")
+
         if args.stats_out:
-            export_root = str(Path(args.stats_out).expanduser().parent)
-        elif getattr(cfg, "stats_path", None):
-            export_root = str(Path(cfg.stats_path).expanduser().parent)
-        else:
-            export_root = "outputs/percentile_stats"
-    export_file_count = _count_per_quant_files(export_root)
-    print(f"[Export] per-quant files = {export_file_count}")
-    if export_file_count == 0:
-        raise RuntimeError(
-            "[PostCheck] per-quantizer export empty. "
-            "Likely causes: (1) mismatched targets between collect/apply (now fixed by normalization), "
-            "(2) observers not hit due to AMP/inference_mode, "
-            "(3) include/exclude filtered all modules, "
-            "(4) stale empty stats file shadows new run. "
-            "Clean outputs/percentile_* and retry."
+            export_payload = OrderedDict()
+            export_payload["config"] = cfg.to_dict()
+            export_payload["targets"] = normalize_targets(stats.get("targets") or [])
+            export_payload["observers"] = stats.get("observers", {})
+            export_payload["normalized_targets"] = list(stats.get("normalized_targets", []))
+            sample_limit = max(0, int(args.export_quantizer_sample or 0))
+            if sample_limit and quantizer_payload:
+                print(
+                    f"[QuantizerSample] previewing first {min(sample_limit, len(quantizer_payload))} entries:"
+                )
+                for idx, (key, payload) in enumerate(quantizer_payload.items()):
+                    if idx >= sample_limit:
+                        break
+                    clip_max = payload.get("clip_max")
+                    if clip_max is None:
+                        clip_max = payload.get("clip")
+                    print(f"  - {key}: clip_max={clip_max}")
+            export_payload.update(quantizer_payload)
+            output_path = Path(args.stats_out).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(export_payload, output_path)
+            if quantizer_export_count > 0:
+                print(
+                    f"[PercentileStats] Exported {quantizer_export_count} quantizer entries to `{args.stats_out}`."
+                )
+            else:
+                print(
+                    f"[PercentileStats][warn] No percentile quantizer entries exported to `{args.stats_out}`."
+                )
+
+        export_root = getattr(cfg, "output_dir", None)
+        if not export_root:
+            if args.stats_out:
+                export_root = str(Path(args.stats_out).expanduser().parent)
+            elif getattr(cfg, "stats_path", None):
+                export_root = str(Path(cfg.stats_path).expanduser().parent)
+            else:
+                export_root = "outputs/percentile_stats"
+        export_file_count = _count_per_quant_files(export_root)
+        print(f"[Export] per-quant files = {export_file_count}")
+        if export_file_count == 0 and args.mode == "collect":
+            raise RuntimeError(
+                "[PostCheck] per-quantizer export empty. "
+                "Likely causes: (1) mismatched targets between collect/apply (now fixed by normalization), "
+                "(2) observers not hit due to AMP/inference_mode, "
+                "(3) include/exclude filtered all modules, "
+                "(4) stale empty stats file shadows new run. "
+                "Clean outputs/percentile_* and retry."
+            )
+
+        observed_targets = stats.get("targets") or []
+        observers = stats.get("observers", {})
+        sample_summary = ", ".join(
+            f"{name}: {observers.get(name, {}).get('numel', 0)}" for name in observed_targets
+        )
+        print(
+            f"Saved percentile statistics to `{getattr(cfg, 'stats_path', '<unknown>')}` ({sample_summary})."
         )
 
-    observed_targets = stats.get("targets") or []
-    sample_summary = ", ".join(
-        f"{name}: {stats['observers'][name]['numel']}" for name in observed_targets if name in stats["observers"]
-    )
-    print(f"Saved percentile statistics to `{cfg.stats_path}` ({sample_summary}).")
+        should_report_latency = True
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                should_report_latency = torch.distributed.get_rank() == 0
+            except Exception:
+                should_report_latency = False
 
-    should_report_latency = True
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if should_report_latency:
+            try:
+                sample_batch = next(iter(dataloader))
+            except StopIteration:
+                sample_batch = None
+            if sample_batch is not None:
+                lat_meter = LatencyMeter(repeat=10)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+                def run_calibration_forward():
+                    pixel_values = sample_batch["pixel_values"]
+                    pixel_values_dev = _move_to_device(pixel_values, device)
+                    pixel_values_dev = _cast_float_payload(pixel_values_dev, dtype)
+                    text_inputs = _extract_text_inputs(sample_batch, model, cfg, device, pixel_values_dev)
+                    with torch.no_grad():
+                        return model(
+                            input_ids=text_inputs.get("input_ids"),
+                            attention_mask=text_inputs.get("attention_mask"),
+                            pixel_values=pixel_values_dev,
+                            use_cache=False,
+                        )
+
+                lat_meter.measure(run_calibration_forward)
+                print(lat_meter.summary())
+    else:
+        if not args.stats_in:
+            raise RuntimeError("[QuantPct] --stats-in is required for apply/real-quant mode.")
+        stats_path = Path(args.stats_in).expanduser()
+        if not stats_path.exists():
+            raise FileNotFoundError(f"[QuantPct] stats file not found: {stats_path}")
+        loaded_stats = torch.load(stats_path, map_location="cpu")
+        enable_kwargs: Dict[str, Any] = {
+            "mode": "apply" if args.mode == "apply" else "real-quant",
+            "export_per_quant": False,
+            "pct": pct_override,
+            "strict_missing_stats": args.strict_missing_stats,
+            "stats": loaded_stats,
+            "stats_path": args.stats_in,
+        }
+        if user_targets is not None:
+            enable_kwargs["targets"] = tuple(user_targets)
+        elif getattr(cfg, "targets", None):
+            enable_kwargs["targets"] = getattr(cfg, "targets")
+
+        quant_hooks_enabled = False
         try:
-            should_report_latency = torch.distributed.get_rank() == 0
-        except Exception:
-            should_report_latency = False
+            quant_pct.enable(model, cfg, **enable_kwargs)
+            quant_hooks_enabled = True
+            checked_q, failed_q = quant_pct.validate_quantizers(model)
+            print(
+                f"[PostCheck] quantizer validation: checked={checked_q} failed={failed_q}"
+            )
+            if failed_q > 0:
+                raise RuntimeError(
+                    f"[PostCheck] quantizer scales invalid: {failed_q}/{checked_q}"
+                )
+            qlin_count, qconv_count = _count_quant_wrappers(model)
+            print(f"[PostWrap] QuantLinear={qlin_count} QuantConv2d={qconv_count}")
+            if (qlin_count + qconv_count) == 0:
+                raise RuntimeError(
+                    "[QuantPct][fatal] No quant wrappers found after enable(). "
+                    "Check include/exclude patterns and ensure percentile wrapping happened during collect."
+                )
+        finally:
+            if quant_hooks_enabled:
+                finalize_fn = getattr(quant_pct, "_finalize_pending_percentiles", None)
+                if callable(finalize_fn):
+                    finalize_logger = getattr(quant_pct, "logger", None)
+                    if finalize_logger is None:
+                        finalize_logger = logging.getLogger("cobra.switches.quant_pct")
+                    try:
+                        finalize_fn(model, finalize_logger)
+                    except Exception as finalize_exc:
+                        print(f"[PercentileStats][warn] finalize failed: {finalize_exc}")
+                quant_pct.disable(model)
 
-    if should_report_latency:
-        try:
-            sample_batch = next(iter(dataloader))
-        except StopIteration:
-            sample_batch = None
-        if sample_batch is not None:
-            lat_meter = LatencyMeter(repeat=10)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
-            def run_calibration_forward():
-                pixel_values = sample_batch["pixel_values"]
-                pixel_values_dev = _move_to_device(pixel_values, device)
-                pixel_values_dev = _cast_float_payload(pixel_values_dev, dtype)
-                text_inputs = _extract_text_inputs(sample_batch, model, cfg, device, pixel_values_dev)
-                with torch.no_grad():
-                    return model(
-                        input_ids=text_inputs.get("input_ids"),
-                        attention_mask=text_inputs.get("attention_mask"),
-                        pixel_values=pixel_values_dev,
-                        use_cache=False,
-                    )
-
-            lat_meter.measure(run_calibration_forward)
-            print(lat_meter.summary())
+        weight_q_after, act_q_after, total_q_after = _count_quantizers(model)
+        print(
+            f"[Debug][Quantizer] after-enable: weight={weight_q_after} act={act_q_after} total={total_q_after}"
+        )
+        export_file_count = _count_per_quant_files(args.stats_in)
+        print(f"[Export] per-quant files = {export_file_count}")
 
     _emit_mem_peak(args, cfg, start_time)
+
 
 
 if __name__ == "__main__":

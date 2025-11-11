@@ -12,6 +12,7 @@ import warnings
 from pathlib import Path
 from collections import defaultdict
 import types
+from difflib import get_close_matches
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
@@ -66,6 +67,26 @@ from cobra.calibrate.enable_pct import (
     _register_passthrough_hooks,
     _emit_mem_peak,
 )
+
+if hasattr(quant_pct, "canonical_quant_key"):
+    _canonical_quant_key = quant_pct.canonical_quant_key
+else:
+    def _canonical_quant_key(module_path: str, role: str) -> str:
+        role_token = role
+        if role_token not in ("weight_quantizer", "act_quantizer"):
+            role_lower = str(role_token).lower()
+            if role_lower.startswith("weight"):
+                role_token = "weight_quantizer"
+            else:
+                role_token = "act_quantizer"
+        cleaned = module_path.strip(".")
+        return f"{cleaned}.{role_token}"
+
+if hasattr(quant_pct, "rewrite_percentile_module_path"):
+    _rewrite_module_path = quant_pct.rewrite_percentile_module_path
+else:
+    def _rewrite_module_path(path: str) -> str:
+        return path
 
 
 _CALIB_IMAGE_EXTENSIONS: Set[str] = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -515,11 +536,6 @@ def _expand_to_limit(paths: List[Path], limit: Optional[int]) -> List[Path]:
     return expanded[:limit]
 
 
-def _format_quantizer_key(module_name: str, role: str, index: int, total: int) -> str:
-    suffix = "" if total <= 1 else f"[{index}]"
-    return f"{module_name}.{role}{suffix}"
-
-
 def _log_real_quant_stage(model: nn.Module, stage: str) -> None:
     observer_stats = count_observers(model)
     total_quantizers = sum(
@@ -805,11 +821,11 @@ def _gather_uninitialized_quantizers(model: nn.Module) -> List[str]:
             quantizers = _iter_uniform_quantizers(getattr(module, attr, None))
             if not quantizers:
                 continue
-            total = len(quantizers)
-            for idx, quantizer in enumerate(quantizers):
+            attr_name = "weight_quantizer" if role.startswith("weight") else "act_quantizer"
+            for quantizer in quantizers:
                 if _quantizer_initialized(quantizer):
                     continue
-                missing.append(_format_quantizer_key(module_name, role, idx, total))
+                missing.append(_canonical_quant_key(module_name, attr_name))
     return missing
 
 
@@ -822,12 +838,12 @@ def _collect_quantizers_with_labels(model: nn.Module) -> Dict[int, tuple[Uniform
             entries = _iter_uniform_quantizers(getattr(module, attr, None))
             if not entries:
                 continue
-            total = len(entries)
-            for idx, quantizer in enumerate(entries):
+            attr_name = "weight_quantizer" if role.startswith("weight") else "act_quantizer"
+            for quantizer in entries:
                 qid = id(quantizer)
                 if qid in quantizers:
                     continue
-                quantizers[qid] = (quantizer, _format_quantizer_key(module_name, role, idx, total))
+                quantizers[qid] = (quantizer, _canonical_quant_key(module_name, attr_name))
     return quantizers
 
 
@@ -1146,7 +1162,13 @@ def _run_fake_quant_calib(
     return processed, quantizer_map
 
 
-def _apply_percentile_stats_from_file(stats_path: Path | str, model: nn.Module) -> None:
+def _apply_percentile_stats_from_file(
+    stats_path: Path | str,
+    model: nn.Module,
+    *,
+    strict_missing_stats: bool = True,
+    denylist: Optional[Set[str]] = None,
+) -> int:
     resolved = Path(stats_path).expanduser()
     if not resolved.exists():
         raise FileNotFoundError(f"Percentile stats file '{resolved}' not found.")
@@ -1155,9 +1177,20 @@ def _apply_percentile_stats_from_file(stats_path: Path | str, model: nn.Module) 
     if not isinstance(payload, Mapping):
         raise TypeError(f"Percentile stats at '{resolved}' must be a mapping, received {type(payload)!r}.")
 
+    normalize_fn = getattr(quant_pct, "_normalize_stat_keys", None)
+    if callable(normalize_fn):
+        try:
+            normalized_payload = normalize_fn(dict(payload))
+            if isinstance(normalized_payload, Mapping):
+                payload = normalized_payload
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("[PercentileStats] normalization via _normalize_stat_keys failed: %s", exc)
+
     consumed: Set[str] = set()
-    missing: List[str] = []
+    missing_details: List[Tuple[str, List[str]]] = []
     applied = 0
+    key_pool = [key for key in payload.keys() if isinstance(key, str)]
+    denylist = set(denylist or set())
 
     for name, module in _iter_named_modules(model):
         if not name:
@@ -1171,20 +1204,34 @@ def _apply_percentile_stats_from_file(stats_path: Path | str, model: nn.Module) 
             ]
             if not quantizers:
                 continue
-            total = len(quantizers)
-            for idx, quantizer in enumerate(quantizers):
-                key = _format_quantizer_key(name, role, idx, total)
-                if key not in payload:
-                    missing.append(key)
-                    continue
-                stats_entry = payload[key]
-                if not isinstance(stats_entry, Mapping):
-                    raise TypeError(
-                        f"Percentile stats for '{key}' must be a mapping, received {type(stats_entry)!r}."
-                    )
-                quantizer.apply_percentile_stats(stats_entry)
+            attr_name = "weight_quantizer" if role.startswith("weight") else "act_quantizer"
+            canonical_name = _rewrite_module_path(name)
+            key = _canonical_quant_key(canonical_name, attr_name)
+            if key in denylist:
                 consumed.add(key)
+                continue
+            stats_entry = payload.get(key)
+            legacy_key = None
+            if stats_entry is None and canonical_name != name:
+                legacy_key = _canonical_quant_key(name, attr_name)
+                if legacy_key in denylist:
+                    consumed.add(legacy_key)
+                    continue
+                stats_entry = payload.get(legacy_key)
+                if stats_entry is not None:
+                    key = legacy_key
+            if stats_entry is None:
+                nearest = get_close_matches(key, key_pool, n=3, cutoff=0.0)
+                missing_details.append((key, nearest))
+                continue
+            if not isinstance(stats_entry, Mapping):
+                raise TypeError(
+                    f"Percentile stats for '{key}' must be a mapping, received {type(stats_entry)!r}."
+                )
+            for quantizer in quantizers:
+                quantizer.apply_percentile_stats(stats_entry)
                 applied += 1
+            consumed.add(key)
 
     unused: List[str] = []
     for raw_key in payload.keys():
@@ -1196,18 +1243,35 @@ def _apply_percentile_stats_from_file(stats_path: Path | str, model: nn.Module) 
         if raw_key not in consumed:
             unused.append(f"{raw_key} (unused)")
 
-    if missing or unused:
-        issues = [f"{key} (missing)" for key in missing] + unused
-        preview = ", ".join(issues[:20])
-        raise KeyError(
-            f"Percentile stats mismatch: {len(issues)} unresolved entries (first 20: {preview})."
+    missing_keys = [key for key, _ in missing_details]
+    if missing_keys or unused:
+        missing_preview = missing_keys[:5]
+        suggest_preview = dict(missing_details[:5]) if missing_details else {}
+        unresolved = len(missing_keys) + len(unused)
+        if strict_missing_stats:
+            raise RuntimeError(
+                "[PercentileStats][fatal] "
+                f"unresolved={unresolved} missing_preview={missing_preview} suggest={suggest_preview} "
+                f"unused_preview={unused[:5]}"
+            )
+        summary = (
+            f"[PercentileStats][warn] unresolved entries: missing={len(missing_keys)} unused={len(unused)} "
+            f"missing_preview={missing_preview} suggest={suggest_preview} unused_preview={unused[:5]}"
         )
+        print(summary)
+        logger.warning(summary)
 
     logging.info("[PercentileStats] Applied %d percentile quantizer entries from %s.", applied, resolved)
     return applied
 
 
-def _load_and_apply_percentile_stats(model: nn.Module, stats_path: str) -> int:
+def _load_and_apply_percentile_stats(
+    model: nn.Module,
+    stats_path: str,
+    *,
+    strict_missing_stats: bool = True,
+    denylist: Optional[Set[str]] = None,
+) -> int:
     """
     讀入 Step 1 產生的百分位統計，支援單檔或資料夾輸入，並套用到模型上的 percentile quantizer。
     """
@@ -1225,10 +1289,20 @@ def _load_and_apply_percentile_stats(model: nn.Module, stats_path: str) -> int:
             )
         applied_total = 0
         for candidate in candidates:
-            applied_total += _apply_percentile_stats_from_file(candidate, model)
+            applied_total += _apply_percentile_stats_from_file(
+                candidate,
+                model,
+                strict_missing_stats=strict_missing_stats,
+                denylist=denylist,
+            )
         return applied_total
 
-    return _apply_percentile_stats_from_file(resolved, model)
+    return _apply_percentile_stats_from_file(
+        resolved,
+        model,
+        strict_missing_stats=strict_missing_stats,
+        denylist=denylist,
+    )
 
 
 def assert_finalized(model: nn.Module) -> Tuple[int, List[str]]:
@@ -1315,6 +1389,12 @@ def _count_and_fix_pending(model: nn.Module) -> Tuple[int, int]:
         print("[Preflight] re-finalize act")
 
     return weight_pending, activation_pending
+
+
+def _force_finalize_all(model: nn.Module) -> None:
+    """Ensure both weight and activation quantizers are finalized."""
+    finalize_all_quantizers(model, kind="weight")
+    finalize_all_quantizers(model, kind="activation")
 
 
 def _build_calib_loader(
@@ -1528,6 +1608,12 @@ def parse_args() -> argparse.Namespace:
         "--lazy-init-via-fakequant",
         action="store_true",
         help="If no stats and no calib data, run a tiny fake-quant replay with synthetic inputs to initialize qparams.",
+    )
+
+    parser.add_argument(
+        "--diagnose-json",
+        default=None,
+        help="Optional path to write diagnostic JSON summary.",
     )
     parser.add_argument(
         "--dump-activations",
@@ -2002,6 +2088,8 @@ def main() -> None:
         if overrides_path.exists():
             try:
                 overrides_applied = _apply_percentile_overrides(model, str(overrides_path))
+                diagnose_payload["overrides_applied"] = overrides_applied
+
                 print(
                     f"[PercentileOverrides] Applied {overrides_applied} entries from `{overrides_path}`."
                 )
@@ -2012,6 +2100,29 @@ def main() -> None:
                         overrides_payload = {}
                     if isinstance(overrides_payload, Mapping):
                         _emit_override_report(model, overrides_payload, overrides_applied)
+                        override_keys: Set[str] = set()
+                        for raw_key in overrides_payload.keys():
+                            if not isinstance(raw_key, str) or "." not in raw_key:
+                                continue
+                            module_name, attr = raw_key.rsplit(".", 1)
+                            attr_name = attr.strip()
+                            if attr_name not in {"weight_quantizer", "act_quantizer"}:
+                                continue
+                            rewritten = _rewrite_module_path(module_name)
+                            try:
+                                canonical_key = _canonical_quant_key(rewritten, attr_name)
+                            except Exception:
+                                continue
+                            override_keys.add(canonical_key)
+                            if rewritten != module_name:
+                                try:
+                                    legacy_key = _canonical_quant_key(module_name, attr_name)
+                                except Exception:
+                                    legacy_key = None
+                                if legacy_key:
+                                    override_keys.add(legacy_key)
+                        if override_keys:
+                            override_denylist.update(override_keys)
                     if getattr(args, "skip_recalib_when_applied", True):
                         need_replay = False
                         print("[PercentileOverrides] Skip short fake-quant replay (overrides applied).")
@@ -2027,8 +2138,15 @@ def main() -> None:
             )
 
         if primary_stats_source:
-            _load_and_apply_percentile_stats(model, primary_stats_source)
+            _load_and_apply_percentile_stats(
+                model,
+                primary_stats_source,
+                strict_missing_stats=args.strict_missing_stats,
+                denylist=override_denylist or None,
+            )
             stats_loaded_early = True
+            diagnose_payload["stats_loaded"] = True
+
             if args.skip_recalib:
                 need_replay = False
                 print("[Step2] Loaded percentile stats from --stats-in; skip fake-quant replay.")
@@ -2094,9 +2212,13 @@ def main() -> None:
                 calibrate_act=bool(args.calibrate_act),
                 real_quant=bool(args.real_quant),
             )
+
+            diagnose_payload["replay_batches"] = fake_replay_processed
             fake_replay_done = True
         else:
-            finalize_all_quantizers(model)
+            _force_finalize_all(model)
+            _record_pending_diag()
+            _raise_on_uninitialized_quantizers(model, "(B) overrides_only")
             _emit_percentile_snapshot(model)
             _guard_real_quant_export(model, real_quant=bool(args.real_quant))
             if args.real_quant:
@@ -2177,13 +2299,13 @@ def main() -> None:
             )
             if initialized_count == 0:
                 if total_quantizers == 0:
-                    warning = "[RealQuant] æœªåµæ¸¬åˆ°éœ€è¦è§€æ¸¬çš„ percentile quantizerï¼Œè·³éŽè§€æ¸¬çµ±è¨ˆæª¢æŸ¥ã€‚"
+                    warning = "[RealQuant] No percentile quantizers observed; skipping observation checks."
                     print(warning)
                     logger.warning(warning)
                 else:
                     warning = (
-                        "[RealQuant] Observer æœªé–‹å•Ÿæˆ– set_static_quant(True) æœªè§£é™¤ï¼Œæœªå–å¾—è§€æ¸¬çµ±è¨ˆï¼›"
-                        " å¾ŒçºŒå°‡ä¾è³´å·²è¼‰å…¥çš„çµ±è¨ˆæˆ– lazy fake-quantã€‚"
+                        "[RealQuant] Observer not enabled or static quant not released; "
+                        "falling back to loaded stats or lazy fake-quant."
                     )
                     print(warning)
                     logger.warning(warning)
@@ -2192,7 +2314,8 @@ def main() -> None:
                         print(hint)
                         logger.warning(hint)
             set_static_quant(model, static_quant=True)
-            finalize_all_quantizers(model)
+            _force_finalize_all(model)
+            _record_pending_diag()
             _raise_on_uninitialized_quantizers(model, stage_label)
             _guard_real_quant_export(model, real_quant=bool(args.real_quant))
             if args.real_quant:
@@ -2201,6 +2324,15 @@ def main() -> None:
                 print("[RealQuant] Skipping register_scales_and_zeros at stage B (real_quant disabled)")
         elif args.skip_recalib:
             print("[RealQuant] --skip-recalib set; skipping observation replay.")
+            set_static_quant(model, static_quant=True)
+            _force_finalize_all(model)
+            _record_pending_diag()
+            _raise_on_uninitialized_quantizers(model, stage_label)
+            _guard_real_quant_export(model, real_quant=bool(args.real_quant))
+            if args.real_quant:
+                register_scales_and_zeros(model)
+            else:
+                print("[RealQuant] Skipping register_scales_and_zeros (skip-recalib path)")
         else:
             loader = _build_calib_loader(args, model, cfg, device, max_calib_batches)
             _activate_observers(model)
@@ -2220,6 +2352,7 @@ def main() -> None:
                     observer.update = original_update
             stage_label = "(B) post_replay"
             print(f"[RealQuant] Replayed {processed} calibration batch(es).")
+            diagnose_payload["replay_batches"] = processed
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             total_quantizers = len(quantizer_map)
@@ -2238,13 +2371,13 @@ def main() -> None:
             )
             if initialized_count == 0:
                 if total_quantizers == 0:
-                    warning = "[RealQuant] 未偵測到需要觀測的 percentile quantizer，跳過觀測統計檢查。"
+                    warning = "[RealQuant] No percentile quantizers observed; skipping observation checks."
                     print(warning)
                     logger.warning(warning)
                 else:
                     warning = (
-                        "[RealQuant] Observer 未開啟或 set_static_quant(True) 未解除，未取得觀測統計；"
-                        " 後續將依賴已載入的統計或 lazy fake-quant。"
+                        "[RealQuant] Observer not enabled or static quant not released; "
+                        "falling back to loaded stats or lazy fake-quant."
                     )
                     print(warning)
                     logger.warning(warning)
@@ -2253,7 +2386,8 @@ def main() -> None:
                         print(hint)
                         logger.warning(hint)
             set_static_quant(model, static_quant=True)
-            finalize_all_quantizers(model)
+            _force_finalize_all(model)
+            _record_pending_diag()
             _raise_on_uninitialized_quantizers(model, stage_label)
             _guard_real_quant_export(model, real_quant=bool(args.real_quant))
             register_scales_and_zeros(model)
@@ -2279,7 +2413,13 @@ def main() -> None:
         set_static_quant(model, static_quant=True)
         if getattr(args, "stats_in", None) and not stats_loaded_early:
             print(f"[RealQuant] Loading percentile stats from {args.stats_in}")
-            _ = _load_and_apply_percentile_stats(model, args.stats_in)
+            _ = _load_and_apply_percentile_stats(
+                model,
+                args.stats_in,
+                strict_missing_stats=args.strict_missing_stats,
+                denylist=override_denylist or None,
+            )
+            diagnose_payload["stats_loaded"] = True
             if args.lazy_init_via_fakequant:
                 remaining_after_stats = count_uninitialized_quantizers(model)
                 if remaining_after_stats > 0:
@@ -2317,10 +2457,13 @@ def main() -> None:
                     if _quantizer_initialized(quant):
                         continue
                     quant.init_from_weight(weight_tensor)
-            finalize_all_quantizers(model)
+            _force_finalize_all(model)
+            _record_pending_diag()
             _raise_on_uninitialized_quantizers(model, "(C) freeze_and_export")
             if _finalize_quant_params is not finalize_all_quantizers:
                 _finalize_quant_params(model)
+            _force_finalize_all(model)
+            _record_pending_diag()
             _ensure_quantizers_ready_for_export("pre-register_scales_and_zeros")
             _guard_real_quant_export(model, real_quant=bool(args.real_quant))
             if args.real_quant:
@@ -2330,11 +2473,15 @@ def main() -> None:
                 print("[RealQuant] Skipping register_scales_and_zeros (freeze/export) because real_quant is disabled")
                 pre_register_called = False
             _log_real_quant_stage(model, "(C) freeze_and_export")
+            _force_finalize_all(model)
+            _record_pending_diag()
             _ensure_quantizers_ready_for_export("post-register_scales_and_zeros")
             missing_after = count_uninitialized_quantizers(model)
             print(f"[RealQuant] Uninitialized quantizers after calibration: {missing_after}")
             assert_all_initialized(model)
             if not pre_register_called and args.real_quant:
+                _force_finalize_all(model)
+                _record_pending_diag()
                 _ensure_quantizers_ready_for_export("fallback-register_scales_and_zeros")
                 _guard_real_quant_export(model, real_quant=bool(args.real_quant))
                 register_scales_and_zeros(model)
@@ -2390,7 +2537,24 @@ def main() -> None:
     dumper = ActivationDumper(dump_targets) if args.dump_activations else None
     dump_handles: List[object] = []
 
+
+    diagnose_payload = {"overrides_applied": 0, "stats_loaded": False, "pending_after_finalize": {"weight": 0, "activation": 0}, "int_mode": bool(args.real_quant), "replay_batches": 0}
+
+    def _record_pending_diag() -> None:
+        pending_weight, pending_activation = _count_pending(model)
+        diagnose_payload["pending_after_finalize"] = {"weight": pending_weight, "activation": pending_activation}
+
+    override_denylist: Set[str] = set()
+
     if args.mode == "off":
+        if args.diagnose_json:
+            _record_pending_diag()
+            diagnose_path = Path(args.diagnose_json).expanduser()
+            diagnose_path.parent.mkdir(parents=True, exist_ok=True)
+            with diagnose_path.open("w", encoding="utf-8") as diag_file:
+                json.dump(diagnose_payload, diag_file, indent=2)
+            print(f"[Diagnose] wrote diagnostics to {diagnose_path}")
+
         quant_pct.disable(model)
         if dumper is not None:
             targets = dump_targets or _DEFAULT_DUMP_POINTS
@@ -2470,6 +2634,22 @@ def main() -> None:
                         "Re-run collect to align observer coverage."
                     )
 
+            normalized_targets = stats_payload.get("normalized_targets") if isinstance(stats_payload, Mapping) else None
+            if not normalized_targets:
+                raise RuntimeError(
+                    "[QuantPct][fatal] Percentile stats missing normalized_targets metadata. "
+                    "Re-run collect with an updated pipeline to embed normalized target names."
+                )
+            normalized_targets = normalize_targets(normalized_targets)
+            normalized_target_set = set(normalized_targets)
+            missing_hook_targets = [target for target in hook_targets if target not in normalized_target_set]
+            if missing_hook_targets:
+                raise RuntimeError(
+                    "[QuantPct][fatal] Percentile stats lack normalized target coverage for required hook targets. "
+                    f"hook_targets={hook_targets} missing={missing_hook_targets}. "
+                    "Re-run collect to refresh stats."
+                )
+
             quant_pct.enable(
                 model,
                 cfg,
@@ -2477,6 +2657,8 @@ def main() -> None:
                 dumper=dumper.capture if dumper is not None else None,
                 targets=canonical_targets,
                 strict_missing_stats=strict_missing,
+                stats=stats_payload,
+                apply_stats_denylist=override_denylist or None,
             )
 
         if args.mode == "apply":
